@@ -15,7 +15,7 @@ This repository contains a dataset characterized by:
 If you use this repo, you can cite [the companion paper](https://ieeexplore.ieee.org/document/10452776) as:
 
 ```bibtex
-@ARTICLE{10452776,
+@ARTICLE{bosello2024ratam,
          author={Bosello, Michael and Aguiari, Davide and Keuter, Yvo and Pallotta, Enrico and Kiade, Sara and Caminati, Gyordan and Pinzarrone, Flavio and Halepota, Junaid and Panerati, Jacopo and Pau, Giovanni},
          journal={IEEE Robotics and Automation Letters}, 
          title={Race Against the Machine: A Fully-Annotated, Open-Design Dataset of Autonomous and Piloted High-Speed Flight}, 
@@ -33,17 +33,18 @@ If you use this repo, you can cite [the companion paper](https://ieeexplore.ieee
 
 The [v3.0.0 release](https://github.com/tii-racing/drone-racing-dataset/releases/tag/v3.0.0) introduces six new piloted flights on the **trackRATM**, flown by world-class FPV pilot **MCK**.
 
-These flights are released as part of the data accompanying our [new paper](https://arxiv.org/abs/2510.13644).
+These flights are released as part of the data accompanying our [new paper](https://ieeexplore.ieee.org/document/11347474).
 
 ```bibtex
-@misc{bosello2025ownprolevelautonomousdrone,
-      title={On Your Own: Pro-level Autonomous Drone Racing in Uninstrumented Arenas}, 
-      author={Michael Bosello and Flavio Pinzarrone and Sara Kiade and Davide Aguiari and Yvo Keuter and Aaesha AlShehhi and Gyordan Caminati and Kei Long Wong and Ka Seng Chou and Junaid Halepota and Fares Alneyadi and Jacopo Panerati and Giovanni Pau},
-      year={2025},
-      eprint={2510.13644},
-      archivePrefix={arXiv},
-      primaryClass={cs.RO},
-      url={https://arxiv.org/abs/2510.13644}, 
+@ARTICLE{bosello2026oyo,
+      author={Bosello, Michael and Pinzarrone, Flavio and Kiade, Sara and Aguiari, Davide and Keuter, Yvo and AlShehhi, Aaesha and Caminati, Gyordan and Wong, Kei Long and Chou, Ka Seng and Halepota, Junaid and Alneyadi, Fares and Panerati, Jacopo and Pau, Giovanni},
+      journal={IEEE Robotics and Automation Letters}, 
+      title={On Your Own: Pro-Level Autonomous Drone Racing in Uninstrumented Arenas}, 
+      year={2026},
+      volume={11},
+      number={3},
+      pages={2674-2681},
+      doi={10.1109/LRA.2026.3653405}
 }
 ```
 
