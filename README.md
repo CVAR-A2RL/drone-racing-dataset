@@ -15,7 +15,7 @@ This repository contains a dataset characterized by:
 If you use this repo, you can cite [the companion paper](https://ieeexplore.ieee.org/document/10452776) as:
 
 ```bibtex
-@ARTICLE{bosello2024ratam,
+@ARTICLE{bosello2024ratm,
          author={Bosello, Michael and Aguiari, Davide and Keuter, Yvo and Pallotta, Enrico and Kiade, Sara and Caminati, Gyordan and Pinzarrone, Flavio and Halepota, Junaid and Panerati, Jacopo and Pau, Giovanni},
          journal={IEEE Robotics and Automation Letters}, 
          title={Race Against the Machine: A Fully-Annotated, Open-Design Dataset of Autonomous and Piloted High-Speed Flight}, 
