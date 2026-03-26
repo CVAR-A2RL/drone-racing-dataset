@@ -5,7 +5,7 @@ import shutil
 from glob import glob
 import pandas as pd
 import cv2
-from sensor_msgs.msg import Imu, CameraInfo, CompressedImage
+from sensor_msgs.msg import Imu, CameraInfo
 from geometry_msgs.msg import PoseStamped
 from cv_bridge import CvBridge
 from rosidl_runtime_py.utilities import get_message
@@ -115,6 +115,8 @@ def main():
     parser.add_argument('--flight', required=True, help="Flight ID (e.g., flight-01p-ellipse)")
     parser.add_argument('--compressed', action='store_true',
                         help="Save images as CompressedImage (JPEG) instead of raw Image")
+    parser.add_argument('--as2', action='store_true',
+                        help="Use Aerostack2 standard topic names (/drone0/...)")
     args = parser.parse_args()
 
     flight_type = "piloted" if "p-" in args.flight else "autonomous"
@@ -181,18 +183,29 @@ def main():
     writer = rosbag2_py.SequentialWriter()
     writer.open(storage_options, converter_options)
 
+    if args.as2:
+        imu_topic = '/drone0/sensor_measurements/imu'
+        pose_topic = '/drone0/self_localization/pose'
+        camera_ns = '/drone0/sensor_measurements/camera'
+    else:
+        imu_topic = '/sensors/imu'
+        pose_topic = '/perception/drone_state'
+        camera_ns = '/camera'
+
     if args.compressed:
-        image_topic = '/camera/image/compressed'
+        image_topic = camera_ns + '/image/compressed'
         image_type = 'sensor_msgs/msg/CompressedImage'
     else:
-        image_topic = '/camera/image'
+        image_topic = camera_ns + '/image'
         image_type = 'sensor_msgs/msg/Image'
 
+    camera_info_topic = camera_ns + '/camera_info'
+
     # create topics
-    create_topic(writer, '/sensors/imu', 'sensor_msgs/msg/Imu')
+    create_topic(writer, imu_topic, 'sensor_msgs/msg/Imu')
     create_topic(writer, image_topic, image_type)
-    create_topic(writer, '/camera/camera_info', 'sensor_msgs/msg/CameraInfo')
-    create_topic(writer, '/perception/drone_state', 'geometry_msgs/PoseStamped')
+    create_topic(writer, camera_info_topic, 'sensor_msgs/msg/CameraInfo')
+    create_topic(writer, pose_topic, 'geometry_msgs/PoseStamped')
 
     print("Converting IMU...")
     for _, row in imu_df.iterrows():
@@ -201,7 +214,7 @@ def main():
             row["accel_x"], row["accel_y"], row["accel_z"],
             row["gyro_x"], row["gyro_y"], row["gyro_z"]
         )
-        writer.write('/sensors/imu', serialize_message(imu_msg),
+        writer.write(imu_topic, serialize_message(imu_msg),
                      int(convert_to_nanosec(row["timestamp"])))
 
     print("Converting POSE...")
@@ -210,7 +223,7 @@ def main():
             convert_to_nanosec(int(row["timestamp"])),
             row["pose"]
         )
-        writer.write('/perception/drone_state', serialize_message(pose_msg),
+        writer.write(pose_topic, serialize_message(pose_msg),
                      int(convert_to_nanosec(row["timestamp"])))
 
     print("Converting IMAGE...(it may take several GBs)")
@@ -235,7 +248,7 @@ def main():
         camera_info_msg = create_camera_info_msg(calib, img_width, img_height, ts_ns)
 
         writer.write(image_topic, serialize_message(img_msg), ts_ns)
-        writer.write('/camera/camera_info', serialize_message(camera_info_msg), ts_ns)
+        writer.write(camera_info_topic, serialize_message(camera_info_msg), ts_ns)
 
     del writer
 
