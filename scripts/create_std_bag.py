@@ -7,6 +7,8 @@ import pandas as pd
 import cv2
 from sensor_msgs.msg import Imu, CameraInfo
 from geometry_msgs.msg import PoseStamped
+from as2_gates_localization.msg import KeypointDetectionArray, KeypointDetection
+from yolo_inference_cpp.msg import BoundingBox as YoloBoundingBox, Keypoint as YoloKeypoint
 from cv_bridge import CvBridge
 from rosidl_runtime_py.utilities import get_message
 from rclpy.serialization import deserialize_message, serialize_message
@@ -88,6 +90,53 @@ def create_camera_info_msg(calib, width, height, timestamp):
     msg.p = [K[0][0], 0.0, K[0][2], 0.0,
              0.0, K[1][1], K[1][2], 0.0,
              0.0, 0.0, 1.0, 0.0]
+    return msg
+
+
+_KEYPOINT_NAMES = ["top_left_inner", "top_right_inner", "bottom_right_inner", "bottom_left_inner"]
+
+
+def create_keypoint_detection_array_msg(label_file, img_width, img_height, timestamp):
+    assert len(str(timestamp)) == 19
+    msg = KeypointDetectionArray()
+    msg.header.stamp.sec = timestamp // 1000000000
+    msg.header.stamp.nanosec = timestamp % 1000000000
+
+    if label_file is None:
+        return msg  # no detections this frame
+
+    with open(label_file) as f:
+        for line in f:
+            values = line.strip().split()
+            if not values:
+                continue
+            class_id = int(values[0])
+            bb_cx, bb_cy, bb_w, bb_h = [float(v) for v in values[1:5]]
+            kps_raw = [float(v) for v in values[5:]]
+
+            det = KeypointDetection()
+            det.label = "gate"
+            det.class_id = class_id
+            det.confidence = 1.0
+
+            det.bounding_box = YoloBoundingBox()
+            det.bounding_box.x1 = (bb_cx - bb_w / 2) * img_width
+            det.bounding_box.y1 = (bb_cy - bb_h / 2) * img_height
+            det.bounding_box.x2 = (bb_cx + bb_w / 2) * img_width
+            det.bounding_box.y2 = (bb_cy + bb_h / 2) * img_height
+            det.bounding_box.confidence = 1.0
+
+            for i in range(4):
+                kx, ky, kvis = kps_raw[i * 3], kps_raw[i * 3 + 1], kps_raw[i * 3 + 2]
+                kp = YoloKeypoint()
+                kp.name = _KEYPOINT_NAMES[i]
+                kp.x = kx * img_width
+                kp.y = ky * img_height
+                kp.visible = (kvis == 2)
+                kp.confidence = 1.0 if kvis == 2 else 0.0
+                det.keypoints.append(kp)
+
+            msg.detections.append(det)
     return msg
 
 
@@ -206,6 +255,9 @@ def main():
     create_topic(writer, image_topic, image_type)
     create_topic(writer, camera_info_topic, 'sensor_msgs/msg/CameraInfo')
     create_topic(writer, pose_topic, 'geometry_msgs/PoseStamped')
+    if args.as2:
+        create_topic(writer, '/drone0/debug/detected_gates_data',
+                     'as2_gates_localization/msg/KeypointDetectionArray')
 
     print("Converting IMU...")
     for _, row in imu_df.iterrows():
@@ -236,6 +288,14 @@ def main():
     first_img = cv2.imread(images[0])
     img_height, img_width = first_img.shape[:2]
 
+    # Build timestamp → label file map
+    label_map = {}
+    if args.as2:
+        label_dir = os.path.join(flight_dir, "label_" + args.flight)
+        for lf in glob(os.path.join(label_dir, "*.txt")):
+            ts = os.path.basename(lf).split('_')[-1].split('.')[0]
+            label_map[ts] = lf
+
     for image in images:
         timestamp = image.split('_')[-1].split('.')[0]
         ts_ns = convert_to_nanosec(int(timestamp))
@@ -249,6 +309,11 @@ def main():
 
         writer.write(image_topic, serialize_message(img_msg), ts_ns)
         writer.write(camera_info_topic, serialize_message(camera_info_msg), ts_ns)
+
+        if args.as2:
+            det_msg = create_keypoint_detection_array_msg(
+                label_map.get(timestamp), img_width, img_height, ts_ns)
+            writer.write('/drone0/debug/detected_gates_data', serialize_message(det_msg), ts_ns)
 
     del writer
 
