@@ -3,10 +3,13 @@ import json
 import os
 import shutil
 from glob import glob
+import numpy as np
 import pandas as pd
 import cv2
+from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import Imu, CameraInfo
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
+from tf2_msgs.msg import TFMessage
 from as2_gates_localization.msg import KeypointDetectionArray, KeypointDetection
 from yolo_inference_cpp.msg import BoundingBox as YoloBoundingBox, Keypoint as YoloKeypoint
 from cv_bridge import CvBridge
@@ -53,31 +56,42 @@ def create_pose_msg(timestamp, pose):
     return pose_img
 
 
-def create_image_msg(image_path, timestamp):
+def create_image_msg(image_path, timestamp, frame_id=''):
     assert len(str(timestamp)) == 19
-    image = cv2.imread(image_path)
+    return create_image_msg_from_array(cv2.imread(image_path), timestamp, frame_id)
+
+
+def create_image_msg_from_array(image, timestamp, frame_id=''):
+    assert len(str(timestamp)) == 19
     bridge = CvBridge()
     image_msg = bridge.cv2_to_imgmsg(image, encoding="bgr8")
     image_msg.header.stamp.sec = timestamp // 1000000000
     image_msg.header.stamp.nanosec = timestamp % 1000000000
+    image_msg.header.frame_id = frame_id
     return image_msg
 
 
-def create_compressed_image_msg(image_path, timestamp):
+def create_compressed_image_msg(image_path, timestamp, frame_id=''):
     assert len(str(timestamp)) == 19
-    image = cv2.imread(image_path)
+    return create_compressed_image_msg_from_array(cv2.imread(image_path), timestamp, frame_id)
+
+
+def create_compressed_image_msg_from_array(image, timestamp, frame_id=''):
+    assert len(str(timestamp)) == 19
     bridge = CvBridge()
     compressed_msg = bridge.cv2_to_compressed_imgmsg(image, dst_format='jpeg')
     compressed_msg.header.stamp.sec = timestamp // 1000000000
     compressed_msg.header.stamp.nanosec = timestamp % 1000000000
+    compressed_msg.header.frame_id = frame_id
     return compressed_msg
 
 
-def create_camera_info_msg(calib, width, height, timestamp):
+def create_camera_info_msg(calib, width, height, timestamp, frame_id=''):
     assert len(str(timestamp)) == 19
     msg = CameraInfo()
     msg.header.stamp.sec = timestamp // 1000000000
     msg.header.stamp.nanosec = timestamp % 1000000000
+    msg.header.frame_id = frame_id
     msg.width = width
     msg.height = height
     msg.distortion_model = 'plumb_bob'
@@ -89,6 +103,26 @@ def create_camera_info_msg(calib, width, height, timestamp):
     msg.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
     msg.p = [K[0][0], 0.0, K[0][2], 0.0,
              0.0, K[1][1], K[1][2], 0.0,
+             0.0, 0.0, 1.0, 0.0]
+    return msg
+
+
+def create_rectified_camera_info_msg(new_K, width, height, timestamp, frame_id=''):
+    assert len(str(timestamp)) == 19
+    msg = CameraInfo()
+    msg.header.stamp.sec = timestamp // 1000000000
+    msg.header.stamp.nanosec = timestamp % 1000000000
+    msg.header.frame_id = frame_id
+    msg.width = width
+    msg.height = height
+    msg.distortion_model = 'plumb_bob'
+    msg.k = [new_K[0][0], new_K[0][1], new_K[0][2],
+             new_K[1][0], new_K[1][1], new_K[1][2],
+             new_K[2][0], new_K[2][1], new_K[2][2]]
+    msg.d = [0.0, 0.0, 0.0, 0.0, 0.0]
+    msg.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    msg.p = [new_K[0][0], 0.0, new_K[0][2], 0.0,
+             0.0, new_K[1][1], new_K[1][2], 0.0,
              0.0, 0.0, 1.0, 0.0]
     return msg
 
@@ -140,6 +174,82 @@ def create_keypoint_detection_array_msg(label_file, img_width, img_height, times
     return msg
 
 
+_CORNER_NAMES = ['tli', 'tri', 'bri', 'bli']  # marker1..marker4, matches _KEYPOINT_NAMES order
+
+
+def write_gate_tf_messages(writer, flight_dir, flight_name):
+    """Write per-frame gate center and corner transforms to /tf."""
+    csv_path = os.path.join(flight_dir, 'csv_raw', f'gate_corners_{flight_name}.csv')
+    if not os.path.exists(csv_path):
+        return
+
+    df = pd.read_csv(csv_path)
+    gate_ids = sorted({
+        int(col.split('_')[0][4:])
+        for col in df.columns if col.startswith('gate') and '_marker1_x' in col
+    })
+
+    # Precompute orientation per gate from mean positions (stable, noise-free)
+    gate_rots = {}
+    gate_quats = {}
+    for gate_id in gate_ids:
+        mean_corners = np.array([
+            [df[f'gate{gate_id}_marker{m}_{ax}'].mean() for ax in ('x', 'y', 'z')]
+            for m in range(1, 5)
+        ])
+        mean_center = mean_corners.mean(axis=0)
+        _, _, Vt = np.linalg.svd(mean_corners - mean_center)
+        x_axis = Vt[0]
+        normal = Vt[2]
+        y_axis = np.cross(normal, x_axis)
+        if np.dot(x_axis, mean_corners[1] - mean_corners[0]) < 0:
+            x_axis = -x_axis
+            y_axis = -y_axis
+        normal = np.cross(x_axis, y_axis)
+        rot_matrix = np.column_stack([x_axis, y_axis, normal])
+        gate_rots[gate_id] = Rotation.from_matrix(rot_matrix).inv()
+        gate_quats[gate_id] = Rotation.from_matrix(rot_matrix).as_quat()
+
+    print("Converting GATE TF...")
+    for _, row in df.iterrows():
+        ts_ns = convert_to_nanosec(int(row['timestamp']))
+        transforms = []
+        for gate_id in gate_ids:
+            gate_frame = f'gate{gate_id - 1}'
+            corners = np.array([
+                [row[f'gate{gate_id}_marker{m}_{ax}'] for ax in ('x', 'y', 'z')]
+                for m in range(1, 5)
+            ])
+            center = corners.mean(axis=0)
+            transforms.append(create_transform_stamped(
+                'earth', gate_frame, center, gate_quats[gate_id], ts_ns))
+            for corner_pos, corner_name in zip(corners, _CORNER_NAMES):
+                local_pos = gate_rots[gate_id].apply(corner_pos - center)
+                transforms.append(create_transform_stamped(
+                    gate_frame, f'{gate_frame}/{corner_name}', local_pos, [0., 0., 0., 1.], ts_ns))
+        writer.write('/tf', serialize_message(create_tf_msg(transforms)), ts_ns)
+
+
+def get_camera_extrinsics(flight_name):
+    """Return (translation [x,y,z], quaternion [x,y,z,w]) for drone→camera transform."""
+    extr_path = os.path.join("..", "camera_calibration", "drone_to_camera.json")
+    with open(extr_path) as f:
+        extr = json.load(f)
+    t = extr["translation"]
+    trans = [t["x"], t["y"], t["z"]]
+    if "trackRATM" in flight_name:
+        rot_key = "trackRATM"
+    elif "p-" in flight_name:
+        rot_key = "piloted"
+    elif "lemniscate" in flight_name:
+        rot_key = "lemniscate"
+    else:
+        rot_key = "ellipse"
+    r = extr["rotation"][rot_key]
+    quat = [r["x"], r["y"], r["z"], r["w"]]
+    return trans, quat
+
+
 def get_calibration_path(flight_name):
     calib_dir = os.path.join("..", "camera_calibration")
     if 'trackRATM' in flight_name:
@@ -151,11 +261,47 @@ def get_calibration_path(flight_name):
         return os.path.join(calib_dir, 'calib_ap-ellipse-lemniscate.json')
 
 
-def create_topic(writer, topic_name, topic_type, serialization_format='cdr'):
-    topic_name = topic_name
-    topic = rosbag2_py.TopicMetadata(name=topic_name, type=topic_type,
-                                     serialization_format=serialization_format)
+def create_transform_stamped(parent, child, trans, quat, timestamp):
+    ts = TransformStamped()
+    ts.header.stamp.sec = timestamp // 1000000000
+    ts.header.stamp.nanosec = timestamp % 1000000000
+    ts.header.frame_id = parent
+    ts.child_frame_id = child
+    ts.transform.translation.x = float(trans[0])
+    ts.transform.translation.y = float(trans[1])
+    ts.transform.translation.z = float(trans[2])
+    ts.transform.rotation.x = float(quat[0])
+    ts.transform.rotation.y = float(quat[1])
+    ts.transform.rotation.z = float(quat[2])
+    ts.transform.rotation.w = float(quat[3])
+    return ts
 
+
+def create_tf_msg(transforms):
+    msg = TFMessage()
+    msg.transforms = transforms
+    return msg
+
+
+# QoS profile string for topics that require TRANSIENT_LOCAL durability (e.g. /tf_static)
+_TRANSIENT_LOCAL_QOS = (
+    "- history: 3\n"
+    "  depth: 0\n"
+    "  reliability: 1\n"
+    "  durability: 1\n"
+    "  deadline:\n    sec: 2147483647\n    nsec: 4294967295\n"
+    "  lifespan:\n    sec: 2147483647\n    nsec: 4294967295\n"
+    "  liveliness: 1\n"
+    "  liveliness_lease_duration:\n    sec: 2147483647\n    nsec: 4294967295\n"
+    "  avoid_ros_namespace_conventions: false\n"
+)
+
+
+def create_topic(writer, topic_name, topic_type, serialization_format='cdr',
+                 offered_qos_profiles=''):
+    topic = rosbag2_py.TopicMetadata(name=topic_name, type=topic_type,
+                                     serialization_format=serialization_format,
+                                     offered_qos_profiles=offered_qos_profiles)
     writer.create_topic(topic)
 
 
@@ -166,6 +312,8 @@ def main():
                         help="Save images as CompressedImage (JPEG) instead of raw Image")
     parser.add_argument('--as2', action='store_true',
                         help="Use Aerostack2 standard topic names (/drone0/...)")
+    parser.add_argument('--rectified', action='store_true',
+                        help="Also publish rectified images on camera_rectified namespace")
     args = parser.parse_args()
 
     flight_type = "piloted" if "p-" in args.flight else "autonomous"
@@ -236,10 +384,12 @@ def main():
         imu_topic = '/drone0/sensor_measurements/imu'
         pose_topic = '/drone0/self_localization/pose'
         camera_ns = '/drone0/sensor_measurements/camera'
+        camera_frame_id = 'drone0/camera/camera_link'
     else:
         imu_topic = '/sensors/imu'
         pose_topic = '/perception/drone_state'
         camera_ns = '/camera'
+        camera_frame_id = 'camera_link'
 
     if args.compressed:
         image_topic = camera_ns + '/image/compressed'
@@ -250,14 +400,24 @@ def main():
 
     camera_info_topic = camera_ns + '/camera_info'
 
+    rect_ns = camera_ns.replace('/camera', '/camera_rectified')
+    rect_image_topic = rect_ns + ('/image/compressed' if args.compressed else '/image')
+    rect_info_topic = rect_ns + '/camera_info'
+
     # create topics
     create_topic(writer, imu_topic, 'sensor_msgs/msg/Imu')
     create_topic(writer, image_topic, image_type)
     create_topic(writer, camera_info_topic, 'sensor_msgs/msg/CameraInfo')
+    if args.rectified:
+        create_topic(writer, rect_image_topic, image_type)
+        create_topic(writer, rect_info_topic, 'sensor_msgs/msg/CameraInfo')
     create_topic(writer, pose_topic, 'geometry_msgs/PoseStamped')
     if args.as2:
         create_topic(writer, '/drone0/debug/detected_gates_data',
                      'as2_gates_localization/msg/KeypointDetectionArray')
+        create_topic(writer, '/tf_static', 'tf2_msgs/msg/TFMessage',
+                     offered_qos_profiles=_TRANSIENT_LOCAL_QOS)
+        create_topic(writer, '/tf', 'tf2_msgs/msg/TFMessage')
 
     print("Converting IMU...")
     for _, row in imu_df.iterrows():
@@ -269,14 +429,43 @@ def main():
         writer.write(imu_topic, serialize_message(imu_msg),
                      int(convert_to_nanosec(row["timestamp"])))
 
+    if args.as2:
+        first_pose = qualisys_df.iloc[0]["pose"]
+        p0 = np.array([first_pose.position.x, first_pose.position.y, first_pose.position.z])
+        q0 = np.array([first_pose.orientation.x, first_pose.orientation.y,
+                        first_pose.orientation.z, first_pose.orientation.w])
+        R0_inv = Rotation.from_quat(q0).inv()
+
+        first_ts = convert_to_nanosec(int(qualisys_df.iloc[0]["timestamp"]))
+        ts_earth_map = create_transform_stamped('earth', 'drone0/map', p0, q0, first_ts)
+        cam_trans, cam_quat = get_camera_extrinsics(args.flight)
+        ts_base_cam = create_transform_stamped(
+            'drone0/base_link', 'drone0/camera/camera_link', cam_trans, cam_quat, first_ts)
+        writer.write('/tf_static', serialize_message(
+            create_tf_msg([ts_earth_map, ts_base_cam])), first_ts)
+
     print("Converting POSE...")
     for _, row in qualisys_df.iterrows():
-        pose_msg = create_pose_msg(
-            convert_to_nanosec(int(row["timestamp"])),
-            row["pose"]
-        )
-        writer.write(pose_topic, serialize_message(pose_msg),
-                     int(convert_to_nanosec(row["timestamp"])))
+        ts_ns = convert_to_nanosec(int(row["timestamp"]))
+        pose_msg = create_pose_msg(ts_ns, row["pose"])
+        writer.write(pose_topic, serialize_message(pose_msg), ts_ns)
+
+        if args.as2:
+            pose = row["pose"]
+            pt = np.array([pose.position.x, pose.position.y, pose.position.z])
+            qt = np.array([pose.orientation.x, pose.orientation.y,
+                           pose.orientation.z, pose.orientation.w])
+            trans = R0_inv.apply(pt - p0)
+            rot = (R0_inv * Rotation.from_quat(qt)).as_quat()
+
+            ts_map_odom = create_transform_stamped(
+                'drone0/map', 'drone0/odom', [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0], ts_ns)
+            ts_odom_base = create_transform_stamped(
+                'drone0/odom', 'drone0/base_link', trans, rot, ts_ns)
+            writer.write('/tf', serialize_message(create_tf_msg([ts_map_odom, ts_odom_base])), ts_ns)
+
+    if args.as2:
+        write_gate_tf_messages(writer, flight_dir, args.flight)
 
     print("Converting IMAGE...(it may take several GBs)")
     images = sorted(glob(image_path + "*"))
@@ -287,6 +476,15 @@ def main():
         calib = json.load(f)
     first_img = cv2.imread(images[0])
     img_height, img_width = first_img.shape[:2]
+
+    # Precompute rectification maps
+    if args.rectified:
+        K_arr = np.array(calib['mtx'])
+        dist_arr = np.array(calib['dist'][0])
+        new_K, _ = cv2.getOptimalNewCameraMatrix(
+            K_arr, dist_arr, (img_width, img_height), alpha=0)
+        map1, map2 = cv2.initUndistortRectifyMap(
+            K_arr, dist_arr, None, new_K, (img_width, img_height), cv2.CV_32FC1)
 
     # Build timestamp → label file map
     label_map = {}
@@ -299,16 +497,28 @@ def main():
     for image in images:
         timestamp = image.split('_')[-1].split('.')[0]
         ts_ns = convert_to_nanosec(int(timestamp))
+        img_arr = cv2.imread(image)
 
         if args.compressed:
-            img_msg = create_compressed_image_msg(image, ts_ns)
+            img_msg = create_compressed_image_msg_from_array(img_arr, ts_ns, camera_frame_id)
         else:
-            img_msg = create_image_msg(image, ts_ns)
+            img_msg = create_image_msg_from_array(img_arr, ts_ns, camera_frame_id)
 
-        camera_info_msg = create_camera_info_msg(calib, img_width, img_height, ts_ns)
+        camera_info_msg = create_camera_info_msg(calib, img_width, img_height, ts_ns, camera_frame_id)
 
         writer.write(image_topic, serialize_message(img_msg), ts_ns)
         writer.write(camera_info_topic, serialize_message(camera_info_msg), ts_ns)
+
+        if args.rectified:
+            rect_arr = cv2.remap(img_arr, map1, map2, cv2.INTER_LINEAR)
+            if args.compressed:
+                rect_msg = create_compressed_image_msg_from_array(rect_arr, ts_ns, camera_frame_id)
+            else:
+                rect_msg = create_image_msg_from_array(rect_arr, ts_ns, camera_frame_id)
+            rect_info_msg = create_rectified_camera_info_msg(
+                new_K, img_width, img_height, ts_ns, camera_frame_id)
+            writer.write(rect_image_topic, serialize_message(rect_msg), ts_ns)
+            writer.write(rect_info_topic, serialize_message(rect_info_msg), ts_ns)
 
         if args.as2:
             det_msg = create_keypoint_detection_array_msg(
