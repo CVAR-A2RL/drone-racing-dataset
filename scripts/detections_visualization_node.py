@@ -6,28 +6,32 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from cv_bridge import CvBridge
-from sensor_msgs.msg import Image, CompressedImage
+from sensor_msgs.msg import Image, CompressedImage, CameraInfo
 from as2_gates_localization.msg import KeypointDetectionArray
 import message_filters
 
 
 # One BGR color per gate index
 _GATE_COLORS = [
-    (0,   0,   255),   # red
-    (0,   255,  0),    # green
-    (255,  0,   0),    # blue
-    (0,   255, 255),   # yellow
-    (255,  0,  255),   # magenta
-    (255, 255,   0),   # cyan
-    (128,  0,  255),   # purple
+    (0, 0, 255),   # red
+    (0, 255, 0),    # green
+    (255, 0, 0),    # blue
+    (0, 255, 255),   # yellow
+    (255, 0, 255),   # magenta
+    (255, 255, 0),   # cyan
+    (128, 0, 255),   # purple
 ]
 
 # Short labels for the four inner corners
 _KP_SHORT = {
-    "top_left_inner":     "TL",
-    "top_right_inner":    "TR",
-    "bottom_right_inner": "BR",
-    "bottom_left_inner":  "BL",
+    "top_left_outer": "TLO",
+    "top_right_outer": "TRO",
+    "bottom_right_outer": "BRO",
+    "bottom_left_outer": "BLO",
+    "top_left_inner": "TLI",
+    "top_right_inner": "TRI",
+    "bottom_right_inner": "BRI",
+    "bottom_left_inner": "BLI",
 }
 
 
@@ -57,22 +61,35 @@ class DetectionsVisualizerNode(Node):
 
         self._pub = self.create_publisher(
             Image,
-            '/drone0/debug/detected_gates_visualization',
+            '/drone0/debug/detected_gates_visualization/image',
             10)
 
         self._pub_compressed = None
         if pub_comp:
             self._pub_compressed = self.create_publisher(
                 CompressedImage,
-                '/drone0/debug/detected_gates_visualization/compressed',
+                '/drone0/debug/detected_gates_visualization/image/compressed',
                 10)
 
-        topics = '/drone0/debug/detected_gates_visualization'
+        self._pub_camera_info = self.create_publisher(
+            CameraInfo,
+            '/drone0/debug/detected_gates_visualization/camera_info',
+            10)
+        self.create_subscription(
+            CameraInfo,
+            '/drone0/sensor_measurements/camera/camera_info',
+            self._camera_info_callback,
+            10)
+
+        topics = '/drone0/debug/detected_gates_visualization/image'
         if pub_comp:
             topics += ' + /compressed'
         self.get_logger().info(
             f"Subscribed to {'compressed ' if compressed else ''}image + detections. "
             f"Publishing visualization on {topics}")
+
+    def _camera_info_callback(self, msg):
+        self._pub_camera_info.publish(msg)
 
     def _callback(self, img_msg, det_msg):
         if self._compressed:
@@ -110,20 +127,25 @@ class DetectionsVisualizerNode(Node):
                 kx, ky = int(round(kp.x)), int(round(kp.y))
                 short = _KP_SHORT.get(kp.name, kp.name)
 
+                arm = 5
                 if kp.visible:
-                    cv2.circle(img, (kx, ky), 5, color, -1)
+                    cv2.circle(img, (kx, ky), 7, color, 2, cv2.LINE_AA)
+                    cv2.line(img, (kx - arm, ky), (kx + arm, ky), color, 1, cv2.LINE_AA)
+                    cv2.line(img, (kx, ky - arm), (kx, ky + arm), color, 1, cv2.LINE_AA)
                     # label to the right-and-up of the point, with a small background
                     # so it reads cleanly on any background
                     (tw, th), _ = cv2.getTextSize(
                         short, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-                    tx, ty = kx + 7, ky - 5
+                    tx, ty = kx + 10, ky - 5
                     cv2.rectangle(img, (tx - 1, ty - th - 1),
                                   (tx + tw + 1, ty + 2), (0, 0, 0), -1)
                     cv2.putText(img, short, (tx, ty),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
                 else:
-                    # hollow circle for non-visible corners
-                    cv2.circle(img, (kx, ky), 5, color, 1)
+                    # thin circle + crosshair for non-visible corners
+                    cv2.circle(img, (kx, ky), 7, color, 1, cv2.LINE_AA)
+                    cv2.line(img, (kx - arm, ky), (kx + arm, ky), color, 1, cv2.LINE_AA)
+                    cv2.line(img, (kx, ky - arm), (kx, ky + arm), color, 1, cv2.LINE_AA)
 
         return img
 
