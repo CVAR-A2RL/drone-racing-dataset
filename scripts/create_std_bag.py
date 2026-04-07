@@ -128,6 +128,115 @@ def create_rectified_camera_info_msg(new_K, width, height, timestamp, frame_id='
 
 
 _KEYPOINT_NAMES = ["top_left_inner", "top_right_inner", "bottom_right_inner", "bottom_left_inner"]
+_OUTER_KEYPOINT_NAMES = ["top_left_outer", "top_right_outer", "bottom_right_outer", "bottom_left_outer"]
+
+
+def _find_nearest_idx(timestamps_arr, target):
+    """Return index of closest value in a sorted numpy array."""
+    idx = np.searchsorted(timestamps_arr, target)
+    if idx == 0:
+        return 0
+    if idx >= len(timestamps_arr):
+        return len(timestamps_arr) - 1
+    if abs(timestamps_arr[idx] - target) < abs(timestamps_arr[idx - 1] - target):
+        return idx
+    return idx - 1
+
+
+def create_keypoint_detection_array_from_3d(
+    pose_row, gate_ids,
+    gate_quats, gate_mean_centers, gate_mean_corners,
+    computed_corners, inner_corners_local, outer_corners_local,
+    K, dist, R_cam_inv, t_cam,
+    img_width, img_height, timestamp_ns,
+    min_visible_corners=3,
+):
+    """Create KeypointDetectionArray by reprojecting 3D gate corners into the image.
+
+    Uses flight-mean gate positions (stable, dropout-free) rather than per-frame CSV
+    data. Per-frame CSV has mocap dropouts that shift individual markers, causing wild
+    jumps in the projected corners.
+
+    Uses the same corners as the TF tree:
+    - Without --computed-corners: mean CSV mocap corners (4 inner).
+    - With --computed-corners: computed inner + outer corners (8 total), reconstructed
+      in world frame as mean_center + R_gate * local_pos, matching what is published in /tf.
+
+    Coordinate chain: earth → drone body (from pose) → camera (from extrinsics) → 2D.
+    Only gates with at least one corner inside the image frame are included.
+    """
+    assert len(str(timestamp_ns)) == 19
+    msg = KeypointDetectionArray()
+    msg.header.stamp.sec = timestamp_ns // 1000000000
+    msg.header.stamp.nanosec = timestamp_ns % 1000000000
+
+    pose = pose_row['pose']
+    pos_drone = np.array([pose.position.x, pose.position.y, pose.position.z])
+    R_drone_inv = Rotation.from_quat([
+        pose.orientation.x, pose.orientation.y,
+        pose.orientation.z, pose.orientation.w,
+    ]).inv()
+
+    for gate_id in gate_ids:
+        center = gate_mean_centers[gate_id]
+
+        if computed_corners:
+            # Reconstruct world-frame positions from gate frame, identical to the TF tree
+            R_gate = Rotation.from_quat(gate_quats[gate_id])
+            corners_earth = np.array(
+                [center + R_gate.apply(lp) for lp in inner_corners_local + outer_corners_local],
+                dtype=np.float64,
+            )
+            kp_names = _KEYPOINT_NAMES + _OUTER_KEYPOINT_NAMES
+        else:
+            corners_earth = gate_mean_corners[gate_id].astype(np.float64)
+            kp_names = _KEYPOINT_NAMES
+
+        # Transform: earth → drone body → camera
+        corners_body = R_drone_inv.apply(corners_earth - pos_drone)
+        corners_cam = R_cam_inv.apply(corners_body - t_cam)
+
+        # Project with lens distortion; shape (N, 1, 2) → (N, 2)
+        projected, _ = cv2.projectPoints(
+            corners_cam, np.zeros(3), np.zeros(3), K, dist)
+        projected = projected.reshape(-1, 2)
+
+        # Visibility: in front of camera and within image bounds
+        in_front = corners_cam[:, 2] > 0
+        visible = (
+            in_front
+            & (projected[:, 0] >= 0) & (projected[:, 0] < img_width)
+            & (projected[:, 1] >= 0) & (projected[:, 1] < img_height)
+        )
+
+        if np.count_nonzero(visible) < min_visible_corners:
+            continue
+
+        vis_pts = projected[visible]
+        det = KeypointDetection()
+        det.label = "gate"
+        det.class_id = 0
+        det.confidence = 1.0
+
+        det.bounding_box = YoloBoundingBox()
+        det.bounding_box.x1 = float(vis_pts[:, 0].min())
+        det.bounding_box.y1 = float(vis_pts[:, 1].min())
+        det.bounding_box.x2 = float(vis_pts[:, 0].max())
+        det.bounding_box.y2 = float(vis_pts[:, 1].max())
+        det.bounding_box.confidence = 1.0
+
+        for i, kp_name in enumerate(kp_names):
+            kp = YoloKeypoint()
+            kp.name = kp_name
+            kp.x = float(projected[i, 0])
+            kp.y = float(projected[i, 1])
+            kp.visible = bool(visible[i])
+            kp.confidence = 1.0 if visible[i] else 0.0
+            det.keypoints.append(kp)
+
+        msg.detections.append(det)
+
+    return msg
 
 
 def create_keypoint_detection_array_msg(label_file, img_width, img_height, timestamp):
@@ -178,6 +287,52 @@ _CORNER_NAMES = ['tli', 'tri', 'bri', 'bli']        # inner corners, marker1..ma
 _OUTER_CORNER_NAMES = ['tlo', 'tro', 'bro', 'blo']  # outer corners (computed mode only)
 
 
+def precompute_gate_orientations(df, gate_ids, fix_rotation):
+    """Return (gate_quats, gate_rots, orig_gate_quats, orig_gate_rots) from corner CSV data.
+
+    gate_quats/gate_rots are the active orientations (yaw-only if fix_rotation, else full SVD).
+    orig_gate_quats/orig_gate_rots are always the full SVD orientations.
+    All computed from mean corner positions across the flight (stable, noise-free).
+    """
+    gate_rots, gate_quats = {}, {}
+    orig_gate_rots, orig_gate_quats = {}, {}
+    gate_mean_centers, gate_mean_corners = {}, {}
+    for gate_id in gate_ids:
+        mean_corners = np.array([
+            [df[f'gate{gate_id}_marker{m}_{ax}'].mean() for ax in ('x', 'y', 'z')]
+            for m in range(1, 5)
+        ])
+        mean_center = mean_corners.mean(axis=0)
+        gate_mean_centers[gate_id] = mean_center
+        gate_mean_corners[gate_id] = mean_corners
+        _, _, Vt = np.linalg.svd(mean_corners - mean_center)
+        x_axis_3d = Vt[0]
+        if np.dot(x_axis_3d, mean_corners[1] - mean_corners[0]) < 0:
+            x_axis_3d = -x_axis_3d
+        # Full 3D orientation from SVD (always computed)
+        normal = Vt[2]
+        y_axis_orig = np.cross(normal, x_axis_3d)
+        z_axis_orig = np.cross(x_axis_3d, y_axis_orig)
+        orig_rot = np.column_stack([x_axis_3d, y_axis_orig, z_axis_orig])
+        orig_gate_rots[gate_id] = Rotation.from_matrix(orig_rot).inv()
+        orig_gate_quats[gate_id] = Rotation.from_matrix(orig_rot).as_quat()
+        if fix_rotation:
+            # Yaw-only: project gate normal (Vt[2]) onto XY plane.
+            # Vt[2] (min variance = normal) is stable and nearly horizontal for a
+            # vertical gate; Vt[0] is degenerate for a square gate and unreliable.
+            z_axis = np.array([normal[0], normal[1], 0.0])
+            z_axis /= np.linalg.norm(z_axis)
+            y_axis = np.array([0.0, 0.0, 1.0])
+            x_axis = np.cross(y_axis, z_axis)
+            fixed_rot = np.column_stack([x_axis, y_axis, z_axis])
+            gate_rots[gate_id] = Rotation.from_matrix(fixed_rot).inv()
+            gate_quats[gate_id] = Rotation.from_matrix(fixed_rot).as_quat()
+        else:
+            gate_rots[gate_id] = orig_gate_rots[gate_id]
+            gate_quats[gate_id] = orig_gate_quats[gate_id]
+    return gate_quats, gate_rots, orig_gate_quats, orig_gate_rots, gate_mean_centers, gate_mean_corners
+
+
 def write_gate_tf_messages(writer, flight_dir, flight_name,
                            computed_corners=False,
                            interior_size=1.5,
@@ -194,46 +349,8 @@ def write_gate_tf_messages(writer, flight_dir, flight_name,
         for col in df.columns if col.startswith('gate') and '_marker1_x' in col
     })
 
-    # Precompute gate orientations from mean corner positions (stable, noise-free)
-    gate_rots = {}
-    gate_quats = {}
-    orig_gate_rots = {}
-    orig_gate_quats = {}
-    for gate_id in gate_ids:
-        mean_corners = np.array([
-            [df[f'gate{gate_id}_marker{m}_{ax}'].mean() for ax in ('x', 'y', 'z')]
-            for m in range(1, 5)
-        ])
-        mean_center = mean_corners.mean(axis=0)
-        _, _, Vt = np.linalg.svd(mean_corners - mean_center)
-        x_axis_3d = Vt[0]
-        # Ensure x_axis points from marker1 toward marker2
-        if np.dot(x_axis_3d, mean_corners[1] - mean_corners[0]) < 0:
-            x_axis_3d = -x_axis_3d
-        # Full 3D orientation from SVD (always computed)
-        normal = Vt[2]
-        y_axis_orig = np.cross(normal, x_axis_3d)
-        z_axis_orig = np.cross(x_axis_3d, y_axis_orig)
-        orig_rot = np.column_stack([x_axis_3d, y_axis_orig, z_axis_orig])
-        orig_gate_rots[gate_id] = Rotation.from_matrix(orig_rot).inv()
-        orig_gate_quats[gate_id] = Rotation.from_matrix(orig_rot).as_quat()
-        if fix_rotation:
-            # Yaw-only orientation: project gate NORMAL (Vt[2]) onto XY plane.
-            # Vt[0] (max variance) is unreliable for a square gate because the gate is
-            # symmetric — SVD is degenerate and Vt[0] can point in any direction within
-            # the gate plane, including nearly vertical, making its XY projection garbage.
-            # Vt[2] (min variance = normal) is stable and nearly horizontal for a
-            # vertical gate, giving the correct yaw.
-            z_axis = np.array([normal[0], normal[1], 0.0])
-            z_axis /= np.linalg.norm(z_axis)      # horizontal gate normal (facing dir)
-            y_axis = np.array([0.0, 0.0, 1.0])    # world Z = gate "up"
-            x_axis = np.cross(y_axis, z_axis)      # gate width direction (horizontal)
-            fixed_rot = np.column_stack([x_axis, y_axis, z_axis])
-            gate_rots[gate_id] = Rotation.from_matrix(fixed_rot).inv()
-            gate_quats[gate_id] = Rotation.from_matrix(fixed_rot).as_quat()
-        else:
-            gate_rots[gate_id] = orig_gate_rots[gate_id]
-            gate_quats[gate_id] = orig_gate_quats[gate_id]
+    gate_quats, gate_rots, orig_gate_quats, orig_gate_rots, _, _ = precompute_gate_orientations(
+        df, gate_ids, fix_rotation)
 
     # Precompute corner positions in gate frame for computed mode
     if computed_corners:
@@ -382,6 +499,13 @@ def main():
                         help="Inner gate opening dimension in meters (default: 1.5)")
     parser.add_argument('--exterior-size', type=float, default=2.7,
                         help="Outer gate frame dimension in meters (default: 2.7)")
+    parser.add_argument('--labels-from-3d', action='store_true',
+                        help="Generate detected_gates_data by reprojecting 3D gate corners "
+                             "instead of reading YOLO label files. Uses the same corners as "
+                             "the TF tree (CSV corners, or computed corners if --computed-corners).")
+    parser.add_argument('--min-visible-corners', type=int, default=3,
+                        help="Minimum number of corners inside the image for a gate to be "
+                             "included when using --labels-from-3d (default: 3)")
     args = parser.parse_args()
 
     flight_type = "piloted" if "p-" in args.flight else "autonomous"
@@ -558,11 +682,48 @@ def main():
 
     # Build timestamp → label file map
     label_map = {}
-    if args.as2:
+    if args.as2 and not args.labels_from_3d:
         label_dir = os.path.join(flight_dir, "label_" + args.flight)
         for lf in glob(os.path.join(label_dir, "*.txt")):
             ts = os.path.basename(lf).split('_')[-1].split('.')[0]
             label_map[ts] = lf
+
+    # Precompute data needed for 3D reprojection labels
+    if args.as2 and args.labels_from_3d:
+        corners_csv = os.path.join(flight_dir, 'csv_raw', f'gate_corners_{args.flight}.csv')
+        gate_corners_df = pd.read_csv(corners_csv)
+        gate_ids_3d = sorted({
+            int(col.split('_')[0][4:])
+            for col in gate_corners_df.columns
+            if col.startswith('gate') and '_marker1_x' in col
+        })
+        K_proj = np.array(calib['mtx'])
+        dist_proj = np.array(calib['dist'][0])
+        cam_trans_3d, cam_quat_3d = get_camera_extrinsics(args.flight)
+        t_cam_3d = np.array(cam_trans_3d)
+        R_cam_inv_3d = Rotation.from_quat(cam_quat_3d).inv()
+        pose_ts_arr = qualisys_df['timestamp'].values
+
+        gate_quats_3d, _, _, _, gate_mean_centers_3d, gate_mean_corners_3d = \
+            precompute_gate_orientations(gate_corners_df, gate_ids_3d, args.fix_rotation)
+
+        if args.computed_corners:
+            half_i = args.interior_size / 2.0
+            half_o = args.exterior_size / 2.0
+            inner_local_3d = [
+                np.array([-half_i,  half_i, 0.0]),
+                np.array([ half_i,  half_i, 0.0]),
+                np.array([ half_i, -half_i, 0.0]),
+                np.array([-half_i, -half_i, 0.0]),
+            ]
+            outer_local_3d = [
+                np.array([-half_o,  half_o, 0.0]),
+                np.array([ half_o,  half_o, 0.0]),
+                np.array([ half_o, -half_o, 0.0]),
+                np.array([-half_o, -half_o, 0.0]),
+            ]
+        else:
+            inner_local_3d = outer_local_3d = None
 
     for image in images:
         timestamp = image.split('_')[-1].split('.')[0]
@@ -591,8 +752,20 @@ def main():
             writer.write(rect_info_topic, serialize_message(rect_info_msg), ts_ns)
 
         if args.as2:
-            det_msg = create_keypoint_detection_array_msg(
-                label_map.get(timestamp), img_width, img_height, ts_ns)
+            if args.labels_from_3d:
+                pose_idx = _find_nearest_idx(pose_ts_arr, int(timestamp))
+                det_msg = create_keypoint_detection_array_from_3d(
+                    qualisys_df.iloc[pose_idx],
+                    gate_ids_3d, gate_quats_3d,
+                    gate_mean_centers_3d, gate_mean_corners_3d,
+                    args.computed_corners, inner_local_3d, outer_local_3d,
+                    K_proj, dist_proj, R_cam_inv_3d, t_cam_3d,
+                    img_width, img_height, ts_ns,
+                    args.min_visible_corners,
+                )
+            else:
+                det_msg = create_keypoint_detection_array_msg(
+                    label_map.get(timestamp), img_width, img_height, ts_ns)
             writer.write('/drone0/debug/detected_gates_data', serialize_message(det_msg), ts_ns)
 
     del writer

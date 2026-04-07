@@ -141,8 +141,8 @@ class DetectionsVisualizerNode(Node):
                                   (tx + tw + 1, ty + 2), (0, 0, 0), -1)
                     cv2.putText(img, short, (tx, ty),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
-                else:
-                    # thin circle + crosshair for non-visible corners
+                elif 0 <= kx < img.shape[1] and 0 <= ky < img.shape[0]:
+                    # thin circle + crosshair for non-visible corners (only if within image)
                     cv2.circle(img, (kx, ky), 7, color, 1, cv2.LINE_AA)
                     cv2.line(img, (kx - arm, ky), (kx + arm, ky), color, 1, cv2.LINE_AA)
                     cv2.line(img, (kx, ky - arm), (kx, ky + arm), color, 1, cv2.LINE_AA)
