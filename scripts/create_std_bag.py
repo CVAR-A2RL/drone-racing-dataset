@@ -174,10 +174,15 @@ def create_keypoint_detection_array_msg(label_file, img_width, img_height, times
     return msg
 
 
-_CORNER_NAMES = ['tli', 'tri', 'bri', 'bli']  # marker1..marker4, matches _KEYPOINT_NAMES order
+_CORNER_NAMES = ['tli', 'tri', 'bri', 'bli']        # inner corners, marker1..marker4
+_OUTER_CORNER_NAMES = ['tlo', 'tro', 'bro', 'blo']  # outer corners (computed mode only)
 
 
-def write_gate_tf_messages(writer, flight_dir, flight_name):
+def write_gate_tf_messages(writer, flight_dir, flight_name,
+                           computed_corners=False,
+                           interior_size=1.5,
+                           exterior_size=2.7,
+                           fix_rotation=False):
     """Write per-frame gate center and corner transforms to /tf."""
     csv_path = os.path.join(flight_dir, 'csv_raw', f'gate_corners_{flight_name}.csv')
     if not os.path.exists(csv_path):
@@ -189,9 +194,11 @@ def write_gate_tf_messages(writer, flight_dir, flight_name):
         for col in df.columns if col.startswith('gate') and '_marker1_x' in col
     })
 
-    # Precompute orientation per gate from mean positions (stable, noise-free)
+    # Precompute gate orientations from mean corner positions (stable, noise-free)
     gate_rots = {}
     gate_quats = {}
+    orig_gate_rots = {}
+    orig_gate_quats = {}
     for gate_id in gate_ids:
         mean_corners = np.array([
             [df[f'gate{gate_id}_marker{m}_{ax}'].mean() for ax in ('x', 'y', 'z')]
@@ -199,16 +206,52 @@ def write_gate_tf_messages(writer, flight_dir, flight_name):
         ])
         mean_center = mean_corners.mean(axis=0)
         _, _, Vt = np.linalg.svd(mean_corners - mean_center)
-        x_axis = Vt[0]
+        x_axis_3d = Vt[0]
+        # Ensure x_axis points from marker1 toward marker2
+        if np.dot(x_axis_3d, mean_corners[1] - mean_corners[0]) < 0:
+            x_axis_3d = -x_axis_3d
+        # Full 3D orientation from SVD (always computed)
         normal = Vt[2]
-        y_axis = np.cross(normal, x_axis)
-        if np.dot(x_axis, mean_corners[1] - mean_corners[0]) < 0:
-            x_axis = -x_axis
-            y_axis = -y_axis
-        normal = np.cross(x_axis, y_axis)
-        rot_matrix = np.column_stack([x_axis, y_axis, normal])
-        gate_rots[gate_id] = Rotation.from_matrix(rot_matrix).inv()
-        gate_quats[gate_id] = Rotation.from_matrix(rot_matrix).as_quat()
+        y_axis_orig = np.cross(normal, x_axis_3d)
+        z_axis_orig = np.cross(x_axis_3d, y_axis_orig)
+        orig_rot = np.column_stack([x_axis_3d, y_axis_orig, z_axis_orig])
+        orig_gate_rots[gate_id] = Rotation.from_matrix(orig_rot).inv()
+        orig_gate_quats[gate_id] = Rotation.from_matrix(orig_rot).as_quat()
+        if fix_rotation:
+            # Yaw-only orientation: project gate NORMAL (Vt[2]) onto XY plane.
+            # Vt[0] (max variance) is unreliable for a square gate because the gate is
+            # symmetric — SVD is degenerate and Vt[0] can point in any direction within
+            # the gate plane, including nearly vertical, making its XY projection garbage.
+            # Vt[2] (min variance = normal) is stable and nearly horizontal for a
+            # vertical gate, giving the correct yaw.
+            z_axis = np.array([normal[0], normal[1], 0.0])
+            z_axis /= np.linalg.norm(z_axis)      # horizontal gate normal (facing dir)
+            y_axis = np.array([0.0, 0.0, 1.0])    # world Z = gate "up"
+            x_axis = np.cross(y_axis, z_axis)      # gate width direction (horizontal)
+            fixed_rot = np.column_stack([x_axis, y_axis, z_axis])
+            gate_rots[gate_id] = Rotation.from_matrix(fixed_rot).inv()
+            gate_quats[gate_id] = Rotation.from_matrix(fixed_rot).as_quat()
+        else:
+            gate_rots[gate_id] = orig_gate_rots[gate_id]
+            gate_quats[gate_id] = orig_gate_quats[gate_id]
+
+    # Precompute corner positions in gate frame for computed mode
+    if computed_corners:
+        half_i = interior_size / 2.0
+        half_o = exterior_size / 2.0
+        # Gate frame: x=width (left→right), y=up (world Z), z=normal
+        inner_corners_local = [
+            np.array([-half_i,  half_i, 0.0]),  # tli
+            np.array([ half_i,  half_i, 0.0]),  # tri
+            np.array([ half_i, -half_i, 0.0]),  # bri
+            np.array([-half_i, -half_i, 0.0]),  # bli
+        ]
+        outer_corners_local = [
+            np.array([-half_o,  half_o, 0.0]),  # tlo
+            np.array([ half_o,  half_o, 0.0]),  # tro
+            np.array([ half_o, -half_o, 0.0]),  # bro
+            np.array([-half_o, -half_o, 0.0]),  # blo
+        ]
 
     print("Converting GATE TF...")
     for _, row in df.iterrows():
@@ -223,10 +266,26 @@ def write_gate_tf_messages(writer, flight_dir, flight_name):
             center = corners.mean(axis=0)
             transforms.append(create_transform_stamped(
                 'earth', gate_frame, center, gate_quats[gate_id], ts_ns))
-            for corner_pos, corner_name in zip(corners, _CORNER_NAMES):
-                local_pos = gate_rots[gate_id].apply(corner_pos - center)
+            if fix_rotation:
+                orig_frame = f'original_{gate_frame}'
                 transforms.append(create_transform_stamped(
-                    gate_frame, f'{gate_frame}/{corner_name}', local_pos, [0., 0., 0., 1.], ts_ns))
+                    'earth', orig_frame, center, orig_gate_quats[gate_id], ts_ns))
+                for corner_pos, corner_name in zip(corners, _CORNER_NAMES):
+                    local_pos = orig_gate_rots[gate_id].apply(corner_pos - center)
+                    transforms.append(create_transform_stamped(
+                        orig_frame, f'{orig_frame}/{corner_name}', local_pos, [0., 0., 0., 1.], ts_ns))
+            if not computed_corners:
+                for corner_pos, corner_name in zip(corners, _CORNER_NAMES):
+                    local_pos = gate_rots[gate_id].apply(corner_pos - center)
+                    transforms.append(create_transform_stamped(
+                        gate_frame, f'{gate_frame}/{corner_name}', local_pos, [0., 0., 0., 1.], ts_ns))
+            else:
+                for local_pos, corner_name in zip(inner_corners_local, _CORNER_NAMES):
+                    transforms.append(create_transform_stamped(
+                        gate_frame, f'{gate_frame}/{corner_name}', local_pos, [0., 0., 0., 1.], ts_ns))
+                for local_pos, corner_name in zip(outer_corners_local, _OUTER_CORNER_NAMES):
+                    transforms.append(create_transform_stamped(
+                        gate_frame, f'{gate_frame}/{corner_name}', local_pos, [0., 0., 0., 1.], ts_ns))
         writer.write('/tf', serialize_message(create_tf_msg(transforms)), ts_ns)
 
 
@@ -314,6 +373,15 @@ def main():
                         help="Use Aerostack2 standard topic names (/drone0/...)")
     parser.add_argument('--rectified', action='store_true',
                         help="Also publish rectified images on camera_rectified namespace")
+    parser.add_argument('--fix-rotation', action='store_true',
+                        help="Force gate TF orientations to yaw-only (roll=0, pitch=0)")
+    parser.add_argument('--computed-corners', action='store_true',
+                        help="Compute 8 corner TFs per gate from --interior-size / --exterior-size "
+                             "instead of using raw CSV mocap corners")
+    parser.add_argument('--interior-size', type=float, default=1.5,
+                        help="Inner gate opening dimension in meters (default: 1.5)")
+    parser.add_argument('--exterior-size', type=float, default=2.7,
+                        help="Outer gate frame dimension in meters (default: 2.7)")
     args = parser.parse_args()
 
     flight_type = "piloted" if "p-" in args.flight else "autonomous"
@@ -465,7 +533,9 @@ def main():
             writer.write('/tf', serialize_message(create_tf_msg([ts_map_odom, ts_odom_base])), ts_ns)
 
     if args.as2:
-        write_gate_tf_messages(writer, flight_dir, args.flight)
+        write_gate_tf_messages(writer, flight_dir, args.flight,
+                               args.computed_corners, args.interior_size, args.exterior_size,
+                               args.fix_rotation)
 
     print("Converting IMAGE...(it may take several GBs)")
     images = sorted(glob(image_path + "*"))
