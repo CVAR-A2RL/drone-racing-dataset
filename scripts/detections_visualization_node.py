@@ -36,20 +36,23 @@ _KP_SHORT = {
 
 
 class DetectionsVisualizerNode(Node):
-    def __init__(self, compressed: bool, pub_comp: bool):
+    def __init__(self, compressed: bool, pub_comp: bool, rectified: bool):
         super().__init__('detections_visualizer')
         self._bridge = CvBridge()
         self._compressed = compressed
         self._pub_comp = pub_comp
 
+        camera_ns = ('camera_rectified' if rectified else 'camera')
+        base_topic = f'/drone0/sensor_measurements/{camera_ns}'
+
         if compressed:
             img_sub = message_filters.Subscriber(
                 self, CompressedImage,
-                '/drone0/sensor_measurements/camera/image/compressed')
+                f'{base_topic}/image/compressed')
         else:
             img_sub = message_filters.Subscriber(
                 self, Image,
-                '/drone0/sensor_measurements/camera/image')
+                f'{base_topic}/image')
 
         det_sub = message_filters.Subscriber(
             self, KeypointDetectionArray,
@@ -77,7 +80,7 @@ class DetectionsVisualizerNode(Node):
             10)
         self.create_subscription(
             CameraInfo,
-            '/drone0/sensor_measurements/camera/camera_info',
+            f'{base_topic}/camera_info',
             self._camera_info_callback,
             10)
 
@@ -85,8 +88,8 @@ class DetectionsVisualizerNode(Node):
         if pub_comp:
             topics += ' + /compressed'
         self.get_logger().info(
-            f"Subscribed to {'compressed ' if compressed else ''}image + detections. "
-            f"Publishing visualization on {topics}")
+            f"Subscribed to {'compressed ' if compressed else ''}{'rectified ' if rectified else ''}"
+            f"image + detections. Publishing visualization on {topics}")
 
     def _camera_info_callback(self, msg):
         self._pub_camera_info.publish(msg)
@@ -156,11 +159,14 @@ def main():
                         help="Subscribe to CompressedImage instead of Image")
     parser.add_argument('--pub_comp', action='store_true',
                         help="Also publish CompressedImage on .../detected_gates_visualization/compressed")
+    parser.add_argument('--rectified', action='store_true',
+                        help="Subscribe to camera_rectified topic instead of camera")
     # rclpy args are passed after '--'
     args, ros_args = parser.parse_known_args()
 
     rclpy.init(args=ros_args)
-    node = DetectionsVisualizerNode(compressed=args.compressed, pub_comp=args.pub_comp)
+    node = DetectionsVisualizerNode(
+        compressed=args.compressed, pub_comp=args.pub_comp, rectified=args.rectified)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

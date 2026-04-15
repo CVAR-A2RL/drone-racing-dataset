@@ -11,6 +11,7 @@ from sensor_msgs.msg import Imu, CameraInfo
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from tf2_msgs.msg import TFMessage
 from as2_gates_localization.msg import KeypointDetectionArray, KeypointDetection
+from as2_msgs.msg import UInt16MultiArrayStamped
 from yolo_inference_cpp.msg import BoundingBox as YoloBoundingBox, Keypoint as YoloKeypoint
 from cv_bridge import CvBridge
 from rosidl_runtime_py.utilities import get_message
@@ -128,7 +129,8 @@ def create_rectified_camera_info_msg(new_K, width, height, timestamp, frame_id='
 
 
 _KEYPOINT_NAMES = ["top_left_inner", "top_right_inner", "bottom_right_inner", "bottom_left_inner"]
-_OUTER_KEYPOINT_NAMES = ["top_left_outer", "top_right_outer", "bottom_right_outer", "bottom_left_outer"]
+_OUTER_KEYPOINT_NAMES = ["top_left_outer", "top_right_outer",
+                         "bottom_right_outer", "bottom_left_outer"]
 
 
 def _find_nearest_idx(timestamps_arr, target):
@@ -150,6 +152,7 @@ def create_keypoint_detection_array_from_3d(
     K, dist, R_cam_inv, t_cam,
     img_width, img_height, timestamp_ns,
     min_visible_corners=3,
+    frame_id='',
 ):
     """Create KeypointDetectionArray by reprojecting 3D gate corners into the image.
 
@@ -169,6 +172,7 @@ def create_keypoint_detection_array_from_3d(
     msg = KeypointDetectionArray()
     msg.header.stamp.sec = timestamp_ns // 1000000000
     msg.header.stamp.nanosec = timestamp_ns % 1000000000
+    msg.header.frame_id = frame_id
 
     pose = pose_row['pose']
     pos_drone = np.array([pose.position.x, pose.position.y, pose.position.z])
@@ -201,10 +205,24 @@ def create_keypoint_detection_array_from_3d(
             corners_cam, np.zeros(3), np.zeros(3), K, dist)
         projected = projected.reshape(-1, 2)
 
-        # Visibility: in front of camera and within image bounds
+        # Guard against distortion polynomial wrap-around (barrel distortion, k1 < 0).
+        # r_d = r_u*(1 + k1*r_u² + ...) has a maximum at r_u_crit = sqrt(1/(-3*k1))
+        # and folds back for larger radii, mapping out-of-FOV points inside the image.
+        # Legitimate edge points have r_u < r_crit; wrap-around artifacts have r_u > r_crit.
+        # Note: checking undistorted pixel bounds would be wrong — barrel distortion makes
+        # the undistorted projection of edge pixels fall outside the distorted image bounds.
+        z = corners_cam[:, 2]
+        k1 = float(dist[0])
+        if k1 < 0:
+            r_u = np.sqrt((corners_cam[:, 0] / z) ** 2 + (corners_cam[:, 1] / z) ** 2)
+            r_crit = np.sqrt(1.0 / (-3.0 * k1))
+            no_wraparound = r_u < r_crit
+        else:
+            no_wraparound = np.ones(len(corners_cam), dtype=bool)
+
         in_front = corners_cam[:, 2] > 0
         visible = (
-            in_front
+            in_front & no_wraparound
             & (projected[:, 0] >= 0) & (projected[:, 0] < img_width)
             & (projected[:, 1] >= 0) & (projected[:, 1] < img_height)
         )
@@ -239,11 +257,12 @@ def create_keypoint_detection_array_from_3d(
     return msg
 
 
-def create_keypoint_detection_array_msg(label_file, img_width, img_height, timestamp):
+def create_keypoint_detection_array_msg(label_file, img_width, img_height, timestamp, frame_id=''):
     assert len(str(timestamp)) == 19
     msg = KeypointDetectionArray()
     msg.header.stamp.sec = timestamp // 1000000000
     msg.header.stamp.nanosec = timestamp % 1000000000
+    msg.header.frame_id = frame_id
 
     if label_file is None:
         return msg  # no detections this frame
@@ -286,6 +305,21 @@ def create_keypoint_detection_array_msg(label_file, img_width, img_height, times
 _CORNER_NAMES = ['tli', 'tri', 'bri', 'bli']        # inner corners, marker1..marker4
 _OUTER_CORNER_NAMES = ['tlo', 'tro', 'bro', 'blo']  # outer corners (computed mode only)
 
+# Default RC channel values (16 channels): roll, pitch, yaw, throttle, arm, ?, offboard, ...
+_RC_DEFAULTS = [1500, 1500, 1500, 990, 990, 990, 990, 990,
+                1500, 1500, 1500, 1980, 1500, 1500, 1500, 1500]
+
+
+def create_rc_msg(timestamp_ns, data):
+    assert len(str(timestamp_ns)) == 19
+    msg = UInt16MultiArrayStamped()
+    msg.stamp.sec = timestamp_ns // 1000000000
+    msg.stamp.nanosec = timestamp_ns % 1000000000
+    msg.layout.dim = []
+    msg.layout.data_offset = 0
+    msg.data = list(data)
+    return msg
+
 
 def precompute_gate_orientations(df, gate_ids, fix_rotation):
     """Return (gate_quats, gate_rots, orig_gate_quats, orig_gate_rots) from corner CSV data.
@@ -309,22 +343,24 @@ def precompute_gate_orientations(df, gate_ids, fix_rotation):
         x_axis_3d = Vt[0]
         if np.dot(x_axis_3d, mean_corners[1] - mean_corners[0]) < 0:
             x_axis_3d = -x_axis_3d
-        # Full 3D orientation from SVD (always computed)
+        # Full 3D orientation from SVD (always computed).
+        # Axis convention: X=normal (old Z), Y=width (old X), Z=up (old Y).
         normal = Vt[2]
         y_axis_orig = np.cross(normal, x_axis_3d)
         z_axis_orig = np.cross(x_axis_3d, y_axis_orig)
-        orig_rot = np.column_stack([x_axis_3d, y_axis_orig, z_axis_orig])
+        orig_rot = np.column_stack([z_axis_orig, x_axis_3d, y_axis_orig])
         orig_gate_rots[gate_id] = Rotation.from_matrix(orig_rot).inv()
         orig_gate_quats[gate_id] = Rotation.from_matrix(orig_rot).as_quat()
         if fix_rotation:
             # Yaw-only: project gate normal (Vt[2]) onto XY plane.
             # Vt[2] (min variance = normal) is stable and nearly horizontal for a
             # vertical gate; Vt[0] is degenerate for a square gate and unreliable.
+            # Axis convention: X=normal (old Z), Y=width (old X), Z=up (old Y).
             z_axis = np.array([normal[0], normal[1], 0.0])
             z_axis /= np.linalg.norm(z_axis)
             y_axis = np.array([0.0, 0.0, 1.0])
             x_axis = np.cross(y_axis, z_axis)
-            fixed_rot = np.column_stack([x_axis, y_axis, z_axis])
+            fixed_rot = np.column_stack([z_axis, x_axis, y_axis])
             gate_rots[gate_id] = Rotation.from_matrix(fixed_rot).inv()
             gate_quats[gate_id] = Rotation.from_matrix(fixed_rot).as_quat()
         else:
@@ -337,8 +373,14 @@ def write_gate_tf_messages(writer, flight_dir, flight_name,
                            computed_corners=False,
                            interior_size=1.5,
                            exterior_size=2.7,
-                           fix_rotation=False):
-    """Write per-frame gate center and corner transforms to /tf."""
+                           fix_rotation=False,
+                           static_gates=False):
+    """Write gate center and corner transforms to /tf (and optionally /tf_static).
+
+    With static_gates=True, gate center TFs are published once to /tf_static using
+    the flight-mean positions instead of per-frame to /tf.  Corners and original_gate
+    frames are unaffected and continue to be written per-frame to /tf.
+    """
     csv_path = os.path.join(flight_dir, 'csv_raw', f'gate_corners_{flight_name}.csv')
     if not os.path.exists(csv_path):
         return
@@ -349,25 +391,35 @@ def write_gate_tf_messages(writer, flight_dir, flight_name,
         for col in df.columns if col.startswith('gate') and '_marker1_x' in col
     })
 
-    gate_quats, gate_rots, orig_gate_quats, orig_gate_rots, _, _ = precompute_gate_orientations(
-        df, gate_ids, fix_rotation)
+    gate_quats, gate_rots, orig_gate_quats, orig_gate_rots, gate_mean_centers, _ = \
+        precompute_gate_orientations(df, gate_ids, fix_rotation)
 
-    # Precompute corner positions in gate frame for computed mode
+    if static_gates:
+        first_ts = convert_to_nanosec(int(df['timestamp'].iloc[0]))
+        static_transforms = [
+            create_transform_stamped(
+                'earth', f'gate{gate_id - 1}',
+                gate_mean_centers[gate_id], gate_quats[gate_id], first_ts)
+            for gate_id in gate_ids
+        ]
+        writer.write('/tf_static', serialize_message(create_tf_msg(static_transforms)), first_ts)
+
+    # Precompute corner positions in gate frame for computed mode.
+    # Gate frame: x=normal (into gate), y=width (left→right), z=up
     if computed_corners:
         half_i = interior_size / 2.0
         half_o = exterior_size / 2.0
-        # Gate frame: x=width (left→right), y=up (world Z), z=normal
         inner_corners_local = [
-            np.array([-half_i,  half_i, 0.0]),  # tli
-            np.array([ half_i,  half_i, 0.0]),  # tri
-            np.array([ half_i, -half_i, 0.0]),  # bri
-            np.array([-half_i, -half_i, 0.0]),  # bli
+            np.array([0.0, -half_i, half_i]),  # tli
+            np.array([0.0, half_i, half_i]),  # tri
+            np.array([0.0, half_i, -half_i]),  # bri
+            np.array([0.0, -half_i, -half_i]),  # bli
         ]
         outer_corners_local = [
-            np.array([-half_o,  half_o, 0.0]),  # tlo
-            np.array([ half_o,  half_o, 0.0]),  # tro
-            np.array([ half_o, -half_o, 0.0]),  # bro
-            np.array([-half_o, -half_o, 0.0]),  # blo
+            np.array([0.0, -half_o, half_o]),  # tlo
+            np.array([0.0, half_o, half_o]),  # tro
+            np.array([0.0, half_o, -half_o]),  # bro
+            np.array([0.0, -half_o, -half_o]),  # blo
         ]
 
     print("Converting GATE TF...")
@@ -381,8 +433,9 @@ def write_gate_tf_messages(writer, flight_dir, flight_name,
                 for m in range(1, 5)
             ])
             center = corners.mean(axis=0)
-            transforms.append(create_transform_stamped(
-                'earth', gate_frame, center, gate_quats[gate_id], ts_ns))
+            if not static_gates:
+                transforms.append(create_transform_stamped(
+                    'earth', gate_frame, center, gate_quats[gate_id], ts_ns))
             if fix_rotation:
                 orig_frame = f'original_{gate_frame}'
                 transforms.append(create_transform_stamped(
@@ -421,6 +474,7 @@ def get_camera_extrinsics(flight_name):
         rot_key = "lemniscate"
     else:
         rot_key = "ellipse"
+    print(f"Rot key for {flight_name}: {rot_key}")
     r = extr["rotation"][rot_key]
     quat = [r["x"], r["y"], r["z"], r["w"]]
     return trans, quat
@@ -495,6 +549,13 @@ def main():
     parser.add_argument('--computed-corners', action='store_true',
                         help="Compute 8 corner TFs per gate from --interior-size / --exterior-size "
                              "instead of using raw CSV mocap corners")
+    parser.add_argument('--static-map', action='store_true',
+                        help="Publish the earth→drone0/map TF to /tf_static (once) instead of "
+                             "per-frame to /tf.")
+    parser.add_argument('--static-gates', action='store_true',
+                        help="Publish gate center TFs to /tf_static (once, using flight-mean "
+                             "positions) instead of per-frame to /tf. Corners and original_gate "
+                             "frames are unaffected.")
     parser.add_argument('--interior-size', type=float, default=1.5,
                         help="Inner gate opening dimension in meters (default: 1.5)")
     parser.add_argument('--exterior-size', type=float, default=2.7,
@@ -503,15 +564,35 @@ def main():
                         help="Generate detected_gates_data by reprojecting 3D gate corners "
                              "instead of reading YOLO label files. Uses the same corners as "
                              "the TF tree (CSV corners, or computed corners if --computed-corners).")
+    parser.add_argument('--rectified-points', action='store_true',
+                        help="Project 3D points onto the rectified image (use with --labels-from-3d). "
+                             "Uses the optimal rectified camera matrix with zero distortion, matching "
+                             "the rectified image published with --rectified.")
     parser.add_argument('--min-visible-corners', type=int, default=3,
                         help="Minimum number of corners inside the image for a gate to be "
                              "included when using --labels-from-3d (default: 3)")
+    parser.add_argument('--cut', action='store_true',
+                        help="Start the bag from the first image timestamp, discarding IMU "
+                             "and pose messages that precede it.")
+    parser.add_argument('--arm', type=float, default=0.0,
+                        help="Write an arm RC message (data[4]=2010) at bag_start + this many "
+                             "seconds (default: 0.0)")
+    parser.add_argument('--offboard', type=float, default=0.0,
+                        help="Write an offboard RC message (data[6]=2010) at bag_start + this "
+                             "many seconds (default: 0.0)")
     args = parser.parse_args()
+
+    if args.offboard < args.arm:
+        parser.error(f"--offboard ({args.offboard}) must be >= --arm ({args.arm})")
 
     flight_type = "piloted" if "p-" in args.flight else "autonomous"
     flight_dir = os.path.join("..", "data", flight_type, args.flight)
     bag_path = os.path.join(flight_dir, f"ros2bag_{args.flight}")
     image_path = os.path.join(flight_dir, "camera_" + args.flight + "/")
+
+    # Determine cut-off timestamp (microseconds) from the first image filename
+    if args.cut:
+        first_image_ts_us = int(sorted(glob(image_path + "*"))[0].split('_')[-1].split('.')[0])
 
     imu_df = pd.DataFrame(columns=["timestamp", "accel_x", "accel_y",
                           "accel_z", "gyro_x", "gyro_y", "gyro_z"])
@@ -610,9 +691,13 @@ def main():
         create_topic(writer, '/tf_static', 'tf2_msgs/msg/TFMessage',
                      offered_qos_profiles=_TRANSIENT_LOCAL_QOS)
         create_topic(writer, '/tf', 'tf2_msgs/msg/TFMessage')
+        create_topic(writer, '/drone0/debug/rc/read',
+                     'as2_msgs/msg/UInt16MultiArrayStamped')
 
     print("Converting IMU...")
     for _, row in imu_df.iterrows():
+        if args.cut and int(row["timestamp"]) < first_image_ts_us:
+            continue
         imu_msg = create_imu_msg(
             convert_to_nanosec(int(row["timestamp"])),
             row["accel_x"], row["accel_y"], row["accel_z"],
@@ -621,23 +706,57 @@ def main():
         writer.write(imu_topic, serialize_message(imu_msg),
                      int(convert_to_nanosec(row["timestamp"])))
 
+    # Compute bag start timestamp (nanoseconds) for RC message offsets
+    if args.cut:
+        bag_start_ns = convert_to_nanosec(first_image_ts_us)
+    else:
+        bag_start_ns = convert_to_nanosec(int(imu_df.iloc[0]["timestamp"]))
+
     if args.as2:
         first_pose = qualisys_df.iloc[0]["pose"]
         p0 = np.array([first_pose.position.x, first_pose.position.y, first_pose.position.z])
         q0 = np.array([first_pose.orientation.x, first_pose.orientation.y,
-                        first_pose.orientation.z, first_pose.orientation.w])
+                       first_pose.orientation.z, first_pose.orientation.w])
         R0_inv = Rotation.from_quat(q0).inv()
 
         first_ts = convert_to_nanosec(int(qualisys_df.iloc[0]["timestamp"]))
-        ts_earth_map = create_transform_stamped('earth', 'drone0/map', p0, q0, first_ts)
         cam_trans, cam_quat = get_camera_extrinsics(args.flight)
         ts_base_cam = create_transform_stamped(
             'drone0/base_link', 'drone0/camera/camera_link', cam_trans, cam_quat, first_ts)
-        writer.write('/tf_static', serialize_message(
-            create_tf_msg([ts_earth_map, ts_base_cam])), first_ts)
+        static_tfs = [ts_base_cam]
+        if args.static_map:
+            ts_earth_map = create_transform_stamped('earth', 'drone0/map', p0, q0, first_ts)
+            static_tfs.append(ts_earth_map)
+        writer.write('/tf_static', serialize_message(create_tf_msg(static_tfs)), first_ts)
+
+        # Write a base RC message at bag start with default values (arm/offboard off)
+        writer.write('/drone0/debug/rc/read',
+                     serialize_message(create_rc_msg(bag_start_ns, _RC_DEFAULTS)), bag_start_ns)
+
+        # Write arm and offboard RC messages at their designated timestamps.
+        # If both land on the same nanosecond, arm is written before offboard.
+        arm_ts_ns = bag_start_ns + int(args.arm * 1e9)
+        offboard_ts_ns = bag_start_ns + int(args.offboard * 1e9)
+
+        arm_data = list(_RC_DEFAULTS)
+        arm_data[4] = 2010
+        offboard_data = list(arm_data)
+        offboard_data[6] = 2010
+
+        if arm_ts_ns == offboard_ts_ns:
+            writer.write('/drone0/debug/rc/read',
+                         serialize_message(create_rc_msg(arm_ts_ns, arm_data)), arm_ts_ns)
+            writer.write('/drone0/debug/rc/read',
+                         serialize_message(create_rc_msg(offboard_ts_ns, offboard_data)), offboard_ts_ns)
+        else:
+            for ts_ns, data in sorted([(arm_ts_ns, arm_data), (offboard_ts_ns, offboard_data)]):
+                writer.write('/drone0/debug/rc/read',
+                             serialize_message(create_rc_msg(ts_ns, data)), ts_ns)
 
     print("Converting POSE...")
     for _, row in qualisys_df.iterrows():
+        if args.cut and int(row["timestamp"]) < first_image_ts_us:
+            continue
         ts_ns = convert_to_nanosec(int(row["timestamp"]))
         pose_msg = create_pose_msg(ts_ns, row["pose"])
         writer.write(pose_topic, serialize_message(pose_msg), ts_ns)
@@ -654,12 +773,16 @@ def main():
                 'drone0/map', 'drone0/odom', [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0], ts_ns)
             ts_odom_base = create_transform_stamped(
                 'drone0/odom', 'drone0/base_link', trans, rot, ts_ns)
-            writer.write('/tf', serialize_message(create_tf_msg([ts_map_odom, ts_odom_base])), ts_ns)
+            dynamic_tfs = [ts_map_odom, ts_odom_base]
+            if not args.static_map:
+                ts_earth_map = create_transform_stamped('earth', 'drone0/map', p0, q0, ts_ns)
+                dynamic_tfs.insert(0, ts_earth_map)
+            writer.write('/tf', serialize_message(create_tf_msg(dynamic_tfs)), ts_ns)
 
     if args.as2:
         write_gate_tf_messages(writer, flight_dir, args.flight,
                                args.computed_corners, args.interior_size, args.exterior_size,
-                               args.fix_rotation)
+                               args.fix_rotation, args.static_gates)
 
     print("Converting IMAGE...(it may take several GBs)")
     images = sorted(glob(image_path + "*"))
@@ -671,12 +794,13 @@ def main():
     first_img = cv2.imread(images[0])
     img_height, img_width = first_img.shape[:2]
 
-    # Precompute rectification maps
-    if args.rectified:
-        K_arr = np.array(calib['mtx'])
-        dist_arr = np.array(calib['dist'][0])
+    # Precompute rectification maps (needed for --rectified image and/or --rectified-points)
+    K_arr = np.array(calib['mtx'])
+    dist_arr = np.array(calib['dist'][0])
+    if args.rectified or args.rectified_points:
         new_K, _ = cv2.getOptimalNewCameraMatrix(
             K_arr, dist_arr, (img_width, img_height), alpha=0)
+    if args.rectified:
         map1, map2 = cv2.initUndistortRectifyMap(
             K_arr, dist_arr, None, new_K, (img_width, img_height), cv2.CV_32FC1)
 
@@ -697,8 +821,12 @@ def main():
             for col in gate_corners_df.columns
             if col.startswith('gate') and '_marker1_x' in col
         })
-        K_proj = np.array(calib['mtx'])
-        dist_proj = np.array(calib['dist'][0])
+        if args.rectified_points:
+            K_proj = new_K                  # optimal rectified camera matrix
+            dist_proj = np.zeros(5)         # rectified image has no distortion
+        else:
+            K_proj = K_arr
+            dist_proj = dist_arr
         cam_trans_3d, cam_quat_3d = get_camera_extrinsics(args.flight)
         t_cam_3d = np.array(cam_trans_3d)
         R_cam_inv_3d = Rotation.from_quat(cam_quat_3d).inv()
@@ -711,16 +839,16 @@ def main():
             half_i = args.interior_size / 2.0
             half_o = args.exterior_size / 2.0
             inner_local_3d = [
-                np.array([-half_i,  half_i, 0.0]),
-                np.array([ half_i,  half_i, 0.0]),
-                np.array([ half_i, -half_i, 0.0]),
-                np.array([-half_i, -half_i, 0.0]),
+                np.array([0.0, -half_i, half_i]),
+                np.array([0.0, half_i, half_i]),
+                np.array([0.0, half_i, -half_i]),
+                np.array([0.0, -half_i, -half_i]),
             ]
             outer_local_3d = [
-                np.array([-half_o,  half_o, 0.0]),
-                np.array([ half_o,  half_o, 0.0]),
-                np.array([ half_o, -half_o, 0.0]),
-                np.array([-half_o, -half_o, 0.0]),
+                np.array([0.0, -half_o, half_o]),
+                np.array([0.0, half_o, half_o]),
+                np.array([0.0, half_o, -half_o]),
+                np.array([0.0, -half_o, -half_o]),
             ]
         else:
             inner_local_3d = outer_local_3d = None
@@ -735,7 +863,8 @@ def main():
         else:
             img_msg = create_image_msg_from_array(img_arr, ts_ns, camera_frame_id)
 
-        camera_info_msg = create_camera_info_msg(calib, img_width, img_height, ts_ns, camera_frame_id)
+        camera_info_msg = create_camera_info_msg(
+            calib, img_width, img_height, ts_ns, camera_frame_id)
 
         writer.write(image_topic, serialize_message(img_msg), ts_ns)
         writer.write(camera_info_topic, serialize_message(camera_info_msg), ts_ns)
@@ -762,10 +891,12 @@ def main():
                     K_proj, dist_proj, R_cam_inv_3d, t_cam_3d,
                     img_width, img_height, ts_ns,
                     args.min_visible_corners,
+                    frame_id=camera_frame_id,
                 )
             else:
                 det_msg = create_keypoint_detection_array_msg(
-                    label_map.get(timestamp), img_width, img_height, ts_ns)
+                    label_map.get(timestamp), img_width, img_height, ts_ns,
+                    frame_id=camera_frame_id)
             writer.write('/drone0/debug/detected_gates_data', serialize_message(det_msg), ts_ns)
 
     del writer
