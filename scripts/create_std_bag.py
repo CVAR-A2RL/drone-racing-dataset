@@ -184,9 +184,9 @@ def create_keypoint_detection_array_from_3d(
     for gate_id in gate_ids:
         center = gate_mean_centers[gate_id]
 
+        R_gate = Rotation.from_quat(gate_quats[gate_id])
         if computed_corners:
             # Reconstruct world-frame positions from gate frame, identical to the TF tree
-            R_gate = Rotation.from_quat(gate_quats[gate_id])
             corners_earth = np.array(
                 [center + R_gate.apply(lp) for lp in inner_corners_local + outer_corners_local],
                 dtype=np.float64,
@@ -195,6 +195,15 @@ def create_keypoint_detection_array_from_3d(
         else:
             corners_earth = gate_mean_corners[gate_id].astype(np.float64)
             kp_names = _KEYPOINT_NAMES
+
+        # Gate normal is the X-axis of the gate frame in world coordinates.
+        # If the drone is on the negative-normal side (viewing from behind), left and right
+        # are mirrored in the image — swap corners so labels match their image positions.
+        gate_normal = R_gate.apply([1.0, 0.0, 0.0])
+        if np.dot(gate_normal, pos_drone - center) < 0:
+            swap = [1, 0, 3, 2]
+            full_swap = swap + [i + 4 for i in swap] if computed_corners else swap
+            corners_earth = corners_earth[full_swap]
 
         # Transform: earth → drone body → camera
         corners_body = R_drone_inv.apply(corners_earth - pos_drone)
