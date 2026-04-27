@@ -128,6 +128,32 @@ def precompute_gate_orientations(df, gate_ids, fix_rotation):
 
 # ── Projection ────────────────────────────────────────────────────────────
 
+def _apply_occlusion(candidates):
+    """Mark keypoints of far gates as not visible when they fall inside the frame
+    region (outer polygon minus inner polygon) of any closer gate.
+
+    candidates: list of [projected(8,2), visible(8,), depth], sorted closest-first.
+    Modifies visible arrays in place.
+
+    Internal corner order: [tli, tri, bri, bli, tlo, tro, bro, blo]
+    Inner polygon: indices 0-3  (tli→tri→bri→bli, clockwise in image space)
+    Outer polygon: indices 4-7  (tlo→tro→bro→blo, clockwise in image space)
+    """
+    for i in range(1, len(candidates)):
+        projected_i, visible_i, _ = candidates[i]
+        for j in range(i):  # gate j is closer than gate i
+            projected_j = candidates[j][0]
+            outer = projected_j[4:8].astype(np.float32)  # tlo, tro, bro, blo
+            inner = projected_j[0:4].astype(np.float32)  # tli, tri, bri, bli
+            for k in range(8):
+                if not visible_i[k]:
+                    continue
+                pt = (float(projected_i[k, 0]), float(projected_i[k, 1]))
+                if (cv2.pointPolygonTest(outer, pt, False) >= 0 and
+                        cv2.pointPolygonTest(inner, pt, False) < 0):
+                    visible_i[k] = False
+
+
 def project_gates(
     pose_row, gate_ids,
     gate_quats, gate_mean_centers,
@@ -150,7 +176,8 @@ def project_gates(
         pose.orientation.z, pose.orientation.w,
     ]).inv()
 
-    results = []
+    # Collect (projected, visible, camera_depth) for all gates that pass initial threshold
+    candidates = []
     for gate_id in gate_ids:
         center = gate_mean_centers[gate_id]
         R_gate = Rotation.from_quat(gate_quats[gate_id])
@@ -196,8 +223,15 @@ def project_gates(
         if np.count_nonzero(visible) < min_visible_corners:
             continue
 
-        results.append((projected, visible))
-    return results
+        depth = float(corners_cam[:, 2].mean())
+        candidates.append([projected, visible, depth])
+
+    # Sort closest-first, then mark keypoints of far gates occluded by closer gate frames
+    candidates.sort(key=lambda c: c[2])
+    _apply_occlusion(candidates)
+
+    # Re-filter after occlusion (some gates may fall below the threshold)
+    return [(p, v) for p, v, _ in candidates if np.count_nonzero(v) >= min_visible_corners]
 
 
 # ── Main ──────────────────────────────────────────────────────────────────

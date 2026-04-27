@@ -142,6 +142,33 @@ _OUTER_KEYPOINT_NAMES = ["top_left_outer", "top_right_outer",
                          "bottom_right_outer", "bottom_left_outer"]
 
 
+def _apply_occlusion(candidates):
+    """Mark keypoints of far gates as not visible when they fall inside the frame
+    region (outer polygon minus inner polygon) of any closer gate.
+
+    candidates: list of [projected(N,2), visible(N,), depth], sorted closest-first.
+    Requires 8 corners per gate (computed_corners mode).
+    Modifies visible arrays in place.
+
+    Internal corner order: [tli, tri, bri, bli, tlo, tro, bro, blo]
+    Inner polygon: indices 0-3  (tli→tri→bri→bli)
+    Outer polygon: indices 4-7  (tlo→tro→bro→blo)
+    """
+    for i in range(1, len(candidates)):
+        projected_i, visible_i, _ = candidates[i]
+        for j in range(i):  # gate j is closer than gate i
+            projected_j = candidates[j][0]
+            outer = projected_j[4:8].astype(np.float32)  # tlo, tro, bro, blo
+            inner = projected_j[0:4].astype(np.float32)  # tli, tri, bri, bli
+            for k in range(len(visible_i)):
+                if not visible_i[k]:
+                    continue
+                pt = (float(projected_i[k, 0]), float(projected_i[k, 1]))
+                if (cv2.pointPolygonTest(outer, pt, False) >= 0 and
+                        cv2.pointPolygonTest(inner, pt, False) < 0):
+                    visible_i[k] = False
+
+
 def _find_nearest_idx(timestamps_arr, target):
     """Return index of closest value in a sorted numpy array."""
     idx = np.searchsorted(timestamps_arr, target)
@@ -191,6 +218,10 @@ def create_keypoint_detection_array_from_3d(
         pose.orientation.z, pose.orientation.w,
     ]).inv()
 
+    kp_names = _KEYPOINT_NAMES + _OUTER_KEYPOINT_NAMES if computed_corners else _KEYPOINT_NAMES
+
+    # Collect candidates: [projected, visible, depth]
+    candidates = []
     for gate_id in gate_ids:
         center = gate_mean_centers[gate_id]
 
@@ -201,10 +232,8 @@ def create_keypoint_detection_array_from_3d(
                 [center + R_gate.apply(lp) for lp in inner_corners_local + outer_corners_local],
                 dtype=np.float64,
             )
-            kp_names = _KEYPOINT_NAMES + _OUTER_KEYPOINT_NAMES
         else:
             corners_earth = gate_mean_corners[gate_id].astype(np.float64)
-            kp_names = _KEYPOINT_NAMES
 
         # Gate normal is the X-axis of the gate frame in world coordinates.
         # If the drone is on the negative-normal side (viewing from behind), left and right
@@ -249,6 +278,19 @@ def create_keypoint_detection_array_from_3d(
             & (projected[:, 1] >= 0) & (projected[:, 1] < img_height)
         )
 
+        if np.count_nonzero(visible) < min_visible_corners:
+            continue
+
+        depth = float(corners_cam[:, 2].mean())
+        candidates.append([projected, visible, depth])
+
+    # Sort closest-first; apply frame occlusion (requires inner + outer corners)
+    candidates.sort(key=lambda c: c[2])
+    if computed_corners:
+        _apply_occlusion(candidates)
+
+    # Build detections, re-filtering gates that fall below threshold after occlusion
+    for projected, visible, _ in candidates:
         if np.count_nonzero(visible) < min_visible_corners:
             continue
 
