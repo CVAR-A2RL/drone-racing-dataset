@@ -8,7 +8,7 @@ import pandas as pd
 import cv2
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import Imu, CameraInfo
-from geometry_msgs.msg import PoseStamped, TransformStamped
+from geometry_msgs.msg import PoseStamped, TwistStamped, TransformStamped
 from tf2_msgs.msg import TFMessage
 from as2_gates_localization.msg import KeypointDetectionArray, KeypointDetection
 from as2_msgs.msg import UInt16MultiArrayStamped
@@ -46,6 +46,15 @@ def create_imu_msg(timestamp, accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z)
     imu_msg.angular_velocity.y = gyro_y
     imu_msg.angular_velocity.z = gyro_z
     return imu_msg
+
+
+def create_twist_msg(timestamp, twist):
+    assert len(str(timestamp)) == 19
+    msg = TwistStamped()
+    msg.header.stamp.sec = timestamp // 1000000000
+    msg.header.stamp.nanosec = timestamp % 1000000000
+    msg.twist = twist
+    return msg
 
 
 def create_pose_msg(timestamp, pose):
@@ -152,6 +161,7 @@ def create_keypoint_detection_array_from_3d(
     K, dist, R_cam_inv, t_cam,
     img_width, img_height, timestamp_ns,
     min_visible_corners=3,
+    noise_std=0.0,
     frame_id='',
 ):
     """Create KeypointDetectionArray by reprojecting 3D gate corners into the image.
@@ -213,6 +223,9 @@ def create_keypoint_detection_array_from_3d(
         projected, _ = cv2.projectPoints(
             corners_cam, np.zeros(3), np.zeros(3), K, dist)
         projected = projected.reshape(-1, 2)
+
+        if noise_std > 0.0:
+            projected = projected + np.random.normal(0.0, noise_std, projected.shape)
 
         # Guard against distortion polynomial wrap-around (barrel distortion, k1 < 0).
         # r_d = r_u*(1 + k1*r_u² + ...) has a maximum at r_u_crit = sqrt(1/(-3*k1))
@@ -580,9 +593,13 @@ def main():
     parser.add_argument('--min-visible-corners', type=int, default=3,
                         help="Minimum number of corners inside the image for a gate to be "
                              "included when using --labels-from-3d (default: 3)")
-    parser.add_argument('--cut', action='store_true',
-                        help="Start the bag from the first image timestamp, discarding IMU "
-                             "and pose messages that precede it.")
+    parser.add_argument('--noise-std', type=float, default=0.0,
+                        help="Standard deviation (pixels) of Gaussian noise added to projected "
+                             "keypoints when using --labels-from-3d (default: 0.0, no noise)")
+    parser.add_argument('--start', type=float, default=None,
+                        help="Discard data before this many seconds from bag start (default: keep all)")
+    parser.add_argument('--end', type=float, default=None,
+                        help="Discard data after this many seconds from bag start (default: keep all)")
     parser.add_argument('--arm', type=float, default=0.0,
                         help="Write an arm RC message (data[4]=2010) at bag_start + this many "
                              "seconds (default: 0.0)")
@@ -598,10 +615,6 @@ def main():
     flight_dir = os.path.join("..", "data", flight_type, args.flight)
     bag_path = os.path.join(flight_dir, f"ros2bag_{args.flight}")
     image_path = os.path.join(flight_dir, "camera_" + args.flight + "/")
-
-    # Determine cut-off timestamp (microseconds) from the first image filename
-    if args.cut:
-        first_image_ts_us = int(sorted(glob(image_path + "*"))[0].split('_')[-1].split('.')[0])
 
     imu_df = pd.DataFrame(columns=["timestamp", "accel_x", "accel_y",
                           "accel_z", "gyro_x", "gyro_y", "gyro_z"])
@@ -648,6 +661,11 @@ def main():
     imu_df = pd.DataFrame(imu_data_list)
     qualisys_df = pd.DataFrame(qualisys_data_list)
 
+    # Compute time window bounds in microseconds relative to first IMU timestamp
+    ref_ts_us = int(imu_df.iloc[0]["timestamp"])
+    cut_start_us = ref_ts_us + int(args.start * 1e6) if args.start is not None else None
+    cut_end_us = ref_ts_us + int(args.end * 1e6) if args.end is not None else None
+
     # Create a ROS2 bag for output
     output_bag_path = os.path.join(flight_dir, "imu_cam_bag")
 
@@ -665,11 +683,13 @@ def main():
     if args.as2:
         imu_topic = '/drone0/sensor_measurements/imu'
         pose_topic = '/drone0/self_localization/pose'
+        twist_topic = '/drone0/self_localization/twist'
         camera_ns = '/drone0/sensor_measurements/camera'
         camera_frame_id = 'drone0/camera/camera_link'
     else:
         imu_topic = '/sensors/imu'
         pose_topic = '/perception/drone_state'
+        twist_topic = None
         camera_ns = '/camera'
         camera_frame_id = 'camera_link'
 
@@ -694,6 +714,8 @@ def main():
         create_topic(writer, rect_image_topic, image_type)
         create_topic(writer, rect_info_topic, 'sensor_msgs/msg/CameraInfo')
     create_topic(writer, pose_topic, 'geometry_msgs/PoseStamped')
+    if twist_topic:
+        create_topic(writer, twist_topic, 'geometry_msgs/msg/TwistStamped')
     if args.as2:
         create_topic(writer, '/drone0/debug/detected_gates_data',
                      'as2_gates_localization/msg/KeypointDetectionArray')
@@ -705,7 +727,10 @@ def main():
 
     print("Converting IMU...")
     for _, row in imu_df.iterrows():
-        if args.cut and int(row["timestamp"]) < first_image_ts_us:
+        ts_us = int(row["timestamp"])
+        if cut_start_us is not None and ts_us < cut_start_us:
+            continue
+        if cut_end_us is not None and ts_us > cut_end_us:
             continue
         imu_msg = create_imu_msg(
             convert_to_nanosec(int(row["timestamp"])),
@@ -716,10 +741,7 @@ def main():
                      int(convert_to_nanosec(row["timestamp"])))
 
     # Compute bag start timestamp (nanoseconds) for RC message offsets
-    if args.cut:
-        bag_start_ns = convert_to_nanosec(first_image_ts_us)
-    else:
-        bag_start_ns = convert_to_nanosec(int(imu_df.iloc[0]["timestamp"]))
+    bag_start_ns = convert_to_nanosec(cut_start_us if cut_start_us is not None else ref_ts_us)
 
     if args.as2:
         first_pose = qualisys_df.iloc[0]["pose"]
@@ -764,11 +786,17 @@ def main():
 
     print("Converting POSE...")
     for _, row in qualisys_df.iterrows():
-        if args.cut and int(row["timestamp"]) < first_image_ts_us:
+        ts_us = int(row["timestamp"])
+        if cut_start_us is not None and ts_us < cut_start_us:
+            continue
+        if cut_end_us is not None and ts_us > cut_end_us:
             continue
         ts_ns = convert_to_nanosec(int(row["timestamp"]))
         pose_msg = create_pose_msg(ts_ns, row["pose"])
         writer.write(pose_topic, serialize_message(pose_msg), ts_ns)
+        if twist_topic:
+            twist_msg = create_twist_msg(ts_ns, row["velocity"])
+            writer.write(twist_topic, serialize_message(twist_msg), ts_ns)
 
         if args.as2:
             pose = row["pose"]
@@ -864,7 +892,12 @@ def main():
 
     for image in images:
         timestamp = image.split('_')[-1].split('.')[0]
-        ts_ns = convert_to_nanosec(int(timestamp))
+        ts_us = int(timestamp)
+        if cut_start_us is not None and ts_us < cut_start_us:
+            continue
+        if cut_end_us is not None and ts_us > cut_end_us:
+            continue
+        ts_ns = convert_to_nanosec(ts_us)
         img_arr = cv2.imread(image)
 
         if args.compressed:
@@ -900,6 +933,7 @@ def main():
                     K_proj, dist_proj, R_cam_inv_3d, t_cam_3d,
                     img_width, img_height, ts_ns,
                     args.min_visible_corners,
+                    args.noise_std,
                     frame_id=camera_frame_id,
                 )
             else:
