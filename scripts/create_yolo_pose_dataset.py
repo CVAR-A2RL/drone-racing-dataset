@@ -78,7 +78,9 @@ def get_camera_extrinsics(flight_name):
         extr = json.load(f)
     t = extr["translation"]
     trans = [t["x"], t["y"], t["z"]]
-    if "trackRATM" in flight_name:
+    if "p-" in flight_name and "trackRATM" in flight_name:
+        rot_key = "piloted_trackRATM"
+    elif "trackRATM" in flight_name:
         rot_key = "trackRATM"
     elif "p-" in flight_name:
         rot_key = "piloted"
@@ -376,9 +378,10 @@ def main():
             proj_out = projected[_YOLO_KP_ORDER]
             vis_out = visible[_YOLO_KP_ORDER]
 
-            vis_pts = projected[visible]
-            x1, y1 = vis_pts[:, 0].min(), vis_pts[:, 1].min()
-            x2, y2 = vis_pts[:, 0].max(), vis_pts[:, 1].max()
+            x1 = max(0.0, projected[:, 0].min())
+            y1 = max(0.0, projected[:, 1].min())
+            x2 = min(float(img_width), projected[:, 0].max())
+            y2 = min(float(img_height), projected[:, 1].max())
             cx = ((x1 + x2) / 2) / img_width
             cy = ((y1 + y2) / 2) / img_height
             bw = (x2 - x1) / img_width

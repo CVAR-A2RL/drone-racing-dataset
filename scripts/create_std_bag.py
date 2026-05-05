@@ -189,6 +189,7 @@ def create_keypoint_detection_array_from_3d(
     img_width, img_height, timestamp_ns,
     min_visible_corners=3,
     noise_std=0.0,
+    gate_depth=0.0,
     frame_id='',
 ):
     """Create KeypointDetectionArray by reprojecting 3D gate corners into the image.
@@ -226,6 +227,9 @@ def create_keypoint_detection_array_from_3d(
         center = gate_mean_centers[gate_id]
 
         R_gate = Rotation.from_quat(gate_quats[gate_id])
+        gate_normal = R_gate.apply([1.0, 0.0, 0.0])
+        dot = np.dot(gate_normal, pos_drone - center)
+
         if computed_corners:
             # Reconstruct world-frame positions from gate frame, identical to the TF tree
             corners_earth = np.array(
@@ -235,11 +239,15 @@ def create_keypoint_detection_array_from_3d(
         else:
             corners_earth = gate_mean_corners[gate_id].astype(np.float64)
 
+        # Shift corners onto the visible face of the gate (gate has physical depth).
+        # The sign of the offset matches the side the drone is on.
+        if gate_depth != 0.0:
+            corners_earth += gate_normal * (gate_depth * np.sign(dot))
+
         # Gate normal is the X-axis of the gate frame in world coordinates.
         # If the drone is on the negative-normal side (viewing from behind), left and right
         # are mirrored in the image — swap corners so labels match their image positions.
-        gate_normal = R_gate.apply([1.0, 0.0, 0.0])
-        if np.dot(gate_normal, pos_drone - center) < 0:
+        if dot < 0:
             swap = [1, 0, 3, 2]
             full_swap = swap + [i + 4 for i in swap] if computed_corners else swap
             corners_earth = corners_earth[full_swap]
@@ -530,7 +538,9 @@ def get_camera_extrinsics(flight_name):
         extr = json.load(f)
     t = extr["translation"]
     trans = [t["x"], t["y"], t["z"]]
-    if "trackRATM" in flight_name:
+    if "p-" in flight_name and "trackRATM" in flight_name:
+        rot_key = "piloted_trackRATM"
+    elif "trackRATM" in flight_name:
         rot_key = "trackRATM"
     elif "p-" in flight_name:
         rot_key = "piloted"
@@ -638,6 +648,10 @@ def main():
     parser.add_argument('--noise-std', type=float, default=0.0,
                         help="Standard deviation (pixels) of Gaussian noise added to projected "
                              "keypoints when using --labels-from-3d (default: 0.0, no noise)")
+    parser.add_argument('--gate-depth', type=float, default=0.0,
+                        help="Depth offset of the visible gate face from the gate center plane "
+                             "in metres when using --labels-from-3d (default: 0.0). Sign is set "
+                             "automatically based on which side of the gate the drone is on.")
     parser.add_argument('--start', type=float, default=None,
                         help="Discard data before this many seconds from bag start (default: keep all)")
     parser.add_argument('--end', type=float, default=None,
@@ -976,6 +990,7 @@ def main():
                     img_width, img_height, ts_ns,
                     args.min_visible_corners,
                     args.noise_std,
+                    args.gate_depth,
                     frame_id=camera_frame_id,
                 )
             else:

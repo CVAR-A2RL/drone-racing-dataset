@@ -36,23 +36,28 @@ _KP_SHORT = {
 
 
 class DetectionsVisualizerNode(Node):
-    def __init__(self, compressed: bool, pub_comp: bool, rectified: bool):
+    def __init__(self, compressed: bool, pub_comp: bool, rectified: bool, image_topic: str = None):
         super().__init__('detections_visualizer')
         self._bridge = CvBridge()
         self._compressed = compressed
         self._pub_comp = pub_comp
 
-        camera_ns = ('camera_rectified' if rectified else 'camera')
-        base_topic = f'/drone0/sensor_measurements/{camera_ns}'
+        if image_topic:
+            base_topic = image_topic.rsplit('/', 1)[0]
+            img_topic = image_topic
+        else:
+            camera_ns = ('camera_rectified' if rectified else 'camera')
+            base_topic = f'/drone0/sensor_measurements/{camera_ns}'
+            img_topic = f'{base_topic}/image'
 
         if compressed:
             img_sub = message_filters.Subscriber(
                 self, CompressedImage,
-                f'{base_topic}/image/compressed')
+                f'{img_topic}/compressed')
         else:
             img_sub = message_filters.Subscriber(
                 self, Image,
-                f'{base_topic}/image')
+                img_topic)
 
         det_sub = message_filters.Subscriber(
             self, KeypointDetectionArray,
@@ -161,12 +166,16 @@ def main():
                         help="Also publish CompressedImage on .../detected_gates_visualization/compressed")
     parser.add_argument('--rectified', action='store_true',
                         help="Subscribe to camera_rectified topic instead of camera")
+    parser.add_argument('--image_topic',
+                        help="Override image topic; base topic is derived by stripping the last segment "
+                             "(e.g. /drone0/.../camera/image -> /drone0/.../camera)")
     # rclpy args are passed after '--'
     args, ros_args = parser.parse_known_args()
 
     rclpy.init(args=ros_args)
     node = DetectionsVisualizerNode(
-        compressed=args.compressed, pub_comp=args.pub_comp, rectified=args.rectified)
+        compressed=args.compressed, pub_comp=args.pub_comp, rectified=args.rectified,
+        image_topic=args.image_topic)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
