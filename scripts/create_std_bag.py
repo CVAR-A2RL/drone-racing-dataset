@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 import os
 import shutil
@@ -53,6 +54,7 @@ def create_twist_msg(timestamp, twist):
     msg = TwistStamped()
     msg.header.stamp.sec = timestamp // 1000000000
     msg.header.stamp.nanosec = timestamp % 1000000000
+    msg.header.frame_id = 'drone0/base_link'
     msg.twist = twist
     return msg
 
@@ -62,6 +64,7 @@ def create_pose_msg(timestamp, pose):
     pose_img = PoseStamped()
     pose_img.header.stamp.sec = timestamp // 1000000000
     pose_img.header.stamp.nanosec = timestamp % 1000000000
+    pose_img.header.frame_id = 'earth'
     pose_img.pose = pose
     return pose_img
 
@@ -645,9 +648,26 @@ def main():
     parser.add_argument('--min-visible-corners', type=int, default=3,
                         help="Minimum number of corners inside the image for a gate to be "
                              "included when using --labels-from-3d (default: 3)")
-    parser.add_argument('--noise-std', type=float, default=0.0,
-                        help="Standard deviation (pixels) of Gaussian noise added to projected "
-                             "keypoints when using --labels-from-3d (default: 0.0, no noise)")
+    parser.add_argument('--noise-std', type=float, nargs='*', default=[],
+                        help="Standard deviation(s) (pixels) of Gaussian noise added to projected "
+                             "keypoints when using --labels-from-3d. Each value produces an extra "
+                             "topic (e.g. --noise-std 1.0 2.0 → "
+                             "/drone0/debug/detected_gates_data_1_0, ...). "
+                             "The original topic is always written without noise.")
+    parser.add_argument('--detections-downsample', type=float, nargs='*', default=[],
+                        help="Downsample rate(s) for detections topics (e.g. --detections-downsample "
+                             "0.5 0.25 → detected_gates_data_ds_0_5, ...). Each rate is applied to "
+                             "the base topic and to every noise topic. The original full-rate topic "
+                             "is always written.")
+    parser.add_argument('--pose-noise-std', type=float, nargs='*', default=[],
+                        help="Standard deviation(s) (metres) of Gaussian noise added to x, y, z "
+                             "of the pose topic. Each value produces an extra topic "
+                             "(e.g. --pose-noise-std 0.2 0.1 → pose_0_2, pose_0_1). "
+                             "The original topic is always written without noise.")
+    parser.add_argument('--pose-downsample', type=float, nargs='*', default=[],
+                        help="Downsample rate(s) for pose topics (e.g. --pose-downsample 0.5 0.25 "
+                             "→ pose_ds_0_5, ...). Each rate is applied to the base pose topic and "
+                             "to every noisy pose topic. The original full-rate topic is always written.")
     parser.add_argument('--gate-depth', type=float, default=0.0,
                         help="Depth offset of the visible gate face from the gate center plane "
                              "in metres when using --labels-from-3d (default: 0.0). Sign is set "
@@ -770,11 +790,34 @@ def main():
         create_topic(writer, rect_image_topic, image_type)
         create_topic(writer, rect_info_topic, 'sensor_msgs/msg/CameraInfo')
     create_topic(writer, pose_topic, 'geometry_msgs/PoseStamped')
+    for _std in args.pose_noise_std:
+        _std_str = str(_std).replace('.', '_')
+        create_topic(writer, f'{pose_topic}_{_std_str}', 'geometry_msgs/PoseStamped')
+    for _ds in args.pose_downsample:
+        _ds_str = str(_ds).replace('.', '_')
+        create_topic(writer, f'{pose_topic}_ds_{_ds_str}', 'geometry_msgs/PoseStamped')
+        for _std in args.pose_noise_std:
+            _std_str = str(_std).replace('.', '_')
+            create_topic(writer, f'{pose_topic}_{_std_str}_ds_{_ds_str}', 'geometry_msgs/PoseStamped')
     if twist_topic:
         create_topic(writer, twist_topic, 'geometry_msgs/msg/TwistStamped')
     if args.as2:
         create_topic(writer, '/drone0/debug/detected_gates_data',
                      'as2_gates_localization/msg/KeypointDetectionArray')
+        for _std in args.noise_std:
+            create_topic(writer,
+                         '/drone0/debug/detected_gates_data_' + str(_std).replace('.', '_'),
+                         'as2_gates_localization/msg/KeypointDetectionArray')
+        for _ds in args.detections_downsample:
+            _ds_str = str(_ds).replace('.', '_')
+            create_topic(writer, f'/drone0/debug/detected_gates_data_ds_{_ds_str}',
+                         'as2_gates_localization/msg/KeypointDetectionArray')
+            if args.labels_from_3d:
+                for _std in args.noise_std:
+                    _std_str = str(_std).replace('.', '_')
+                    create_topic(writer,
+                                 f'/drone0/debug/detected_gates_data_{_std_str}_ds_{_ds_str}',
+                                 'as2_gates_localization/msg/KeypointDetectionArray')
         create_topic(writer, '/tf_static', 'tf2_msgs/msg/TFMessage',
                      offered_qos_profiles=_TRANSIENT_LOCAL_QOS)
         create_topic(writer, '/tf', 'tf2_msgs/msg/TFMessage')
@@ -841,6 +884,7 @@ def main():
                              serialize_message(create_rc_msg(ts_ns, data)), ts_ns)
 
     print("Converting POSE...")
+    _pose_ds_budgets = {ds: 0.0 for ds in args.pose_downsample}
     for _, row in qualisys_df.iterrows():
         ts_us = int(row["timestamp"])
         if cut_start_us is not None and ts_us < cut_start_us:
@@ -848,12 +892,8 @@ def main():
         if cut_end_us is not None and ts_us > cut_end_us:
             continue
         ts_ns = convert_to_nanosec(int(row["timestamp"]))
-        pose_msg = create_pose_msg(ts_ns, row["pose"])
-        writer.write(pose_topic, serialize_message(pose_msg), ts_ns)
-        if twist_topic:
-            twist_msg = create_twist_msg(ts_ns, row["velocity"])
-            writer.write(twist_topic, serialize_message(twist_msg), ts_ns)
 
+        # Write TF first so RViz can resolve frame_id lookups when pose messages arrive
         if args.as2:
             pose = row["pose"]
             pt = np.array([pose.position.x, pose.position.y, pose.position.z])
@@ -871,6 +911,34 @@ def main():
                 ts_earth_map = create_transform_stamped('earth', 'drone0/map', p0, q0, ts_ns)
                 dynamic_tfs.insert(0, ts_earth_map)
             writer.write('/tf', serialize_message(create_tf_msg(dynamic_tfs)), ts_ns)
+
+        pose_msg = create_pose_msg(ts_ns, row["pose"])
+        writer.write(pose_topic, serialize_message(pose_msg), ts_ns)
+
+        _pose_ds_fire = {}
+        for _ds in args.pose_downsample:
+            _pose_ds_budgets[_ds] += _ds
+            if _pose_ds_budgets[_ds] >= 1.0:
+                _pose_ds_budgets[_ds] -= 1.0
+                _pose_ds_fire[_ds] = str(_ds).replace('.', '_')
+
+        for _ds, _ds_str in _pose_ds_fire.items():
+            writer.write(f'{pose_topic}_ds_{_ds_str}', serialize_message(pose_msg), ts_ns)
+
+        for _std in args.pose_noise_std:
+            _std_str = str(_std).replace('.', '_')
+            noisy_pose = copy.deepcopy(row["pose"])
+            noisy_pose.position.x += np.random.normal(0.0, _std)
+            noisy_pose.position.y += np.random.normal(0.0, _std)
+            noisy_pose.position.z += np.random.normal(0.0, _std)
+            noisy_msg = create_pose_msg(ts_ns, noisy_pose)
+            writer.write(f'{pose_topic}_{_std_str}', serialize_message(noisy_msg), ts_ns)
+            for _ds, _ds_str in _pose_ds_fire.items():
+                writer.write(f'{pose_topic}_{_std_str}_ds_{_ds_str}',
+                             serialize_message(noisy_msg), ts_ns)
+        if twist_topic:
+            twist_msg = create_twist_msg(ts_ns, row["velocity"])
+            writer.write(twist_topic, serialize_message(twist_msg), ts_ns)
 
     if args.as2:
         write_gate_tf_messages(writer, flight_dir, args.flight,
@@ -946,6 +1014,8 @@ def main():
         else:
             inner_local_3d = outer_local_3d = None
 
+    _ds_budgets = {ds: 0.0 for ds in args.detections_downsample}
+
     for image in images:
         timestamp = image.split('_')[-1].split('.')[0]
         ts_us = int(timestamp)
@@ -978,26 +1048,59 @@ def main():
             writer.write(rect_image_topic, serialize_message(rect_msg), ts_ns)
             writer.write(rect_info_topic, serialize_message(rect_info_msg), ts_ns)
 
+        # Advance downsample budgets for this frame
+        _ds_fire = {}
+        for _ds in args.detections_downsample:
+            _ds_budgets[_ds] += _ds
+            if _ds_budgets[_ds] >= 1.0:
+                _ds_budgets[_ds] -= 1.0
+                _ds_fire[_ds] = str(_ds).replace('.', '_')
+
         if args.as2:
             if args.labels_from_3d:
                 pose_idx = _find_nearest_idx(pose_ts_arr, int(timestamp))
-                det_msg = create_keypoint_detection_array_from_3d(
-                    qualisys_df.iloc[pose_idx],
-                    gate_ids_3d, gate_quats_3d,
-                    gate_mean_centers_3d, gate_mean_corners_3d,
-                    args.computed_corners, inner_local_3d, outer_local_3d,
-                    K_proj, dist_proj, R_cam_inv_3d, t_cam_3d,
-                    img_width, img_height, ts_ns,
-                    args.min_visible_corners,
-                    args.noise_std,
-                    args.gate_depth,
+                _kd_kwargs = dict(
+                    pose_row=qualisys_df.iloc[pose_idx],
+                    gate_ids=gate_ids_3d, gate_quats=gate_quats_3d,
+                    gate_mean_centers=gate_mean_centers_3d,
+                    gate_mean_corners=gate_mean_corners_3d,
+                    computed_corners=args.computed_corners,
+                    inner_corners_local=inner_local_3d,
+                    outer_corners_local=outer_local_3d,
+                    K=K_proj, dist=dist_proj,
+                    R_cam_inv=R_cam_inv_3d, t_cam=t_cam_3d,
+                    img_width=img_width, img_height=img_height,
+                    timestamp_ns=ts_ns,
+                    min_visible_corners=args.min_visible_corners,
+                    gate_depth=args.gate_depth,
                     frame_id=camera_frame_id,
                 )
+                det_msg = create_keypoint_detection_array_from_3d(
+                    **_kd_kwargs, noise_std=0.0)
+                writer.write('/drone0/debug/detected_gates_data',
+                             serialize_message(det_msg), ts_ns)
+                for _ds, _ds_str in _ds_fire.items():
+                    writer.write(f'/drone0/debug/detected_gates_data_ds_{_ds_str}',
+                                 serialize_message(det_msg), ts_ns)
+                for _std in args.noise_std:
+                    _std_str = str(_std).replace('.', '_')
+                    det_msg_noisy = create_keypoint_detection_array_from_3d(
+                        **_kd_kwargs, noise_std=_std)
+                    writer.write(f'/drone0/debug/detected_gates_data_{_std_str}',
+                                 serialize_message(det_msg_noisy), ts_ns)
+                    for _ds, _ds_str in _ds_fire.items():
+                        writer.write(
+                            f'/drone0/debug/detected_gates_data_{_std_str}_ds_{_ds_str}',
+                            serialize_message(det_msg_noisy), ts_ns)
             else:
                 det_msg = create_keypoint_detection_array_msg(
                     label_map.get(timestamp), img_width, img_height, ts_ns,
                     frame_id=camera_frame_id)
-            writer.write('/drone0/debug/detected_gates_data', serialize_message(det_msg), ts_ns)
+                writer.write('/drone0/debug/detected_gates_data',
+                             serialize_message(det_msg), ts_ns)
+                for _ds, _ds_str in _ds_fire.items():
+                    writer.write(f'/drone0/debug/detected_gates_data_ds_{_ds_str}',
+                                 serialize_message(det_msg), ts_ns)
 
     del writer
 

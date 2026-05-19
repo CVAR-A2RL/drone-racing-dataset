@@ -36,7 +36,8 @@ _KP_SHORT = {
 
 
 class DetectionsVisualizerNode(Node):
-    def __init__(self, compressed: bool, pub_comp: bool, rectified: bool, image_topic: str = None):
+    def __init__(self, compressed: bool, pub_comp: bool, rectified: bool, image_topic: str = None,
+                 detections_topic: str = '/drone0/debug/detected_gates_data'):
         super().__init__('detections_visualizer')
         self._bridge = CvBridge()
         self._compressed = compressed
@@ -61,7 +62,7 @@ class DetectionsVisualizerNode(Node):
 
         det_sub = message_filters.Subscriber(
             self, KeypointDetectionArray,
-            '/drone0/debug/detected_gates_data')
+            detections_topic)
 
         self._sync = message_filters.ApproximateTimeSynchronizer(
             [img_sub, det_sub], queue_size=20, slop=0.05)
@@ -94,7 +95,7 @@ class DetectionsVisualizerNode(Node):
             topics += ' + /compressed'
         self.get_logger().info(
             f"Subscribed to {'compressed ' if compressed else ''}{'rectified ' if rectified else ''}"
-            f"image + detections. Publishing visualization on {topics}")
+            f"image + detections ({detections_topic}). Publishing visualization on {topics}")
 
     def _camera_info_callback(self, msg):
         self._pub_camera_info.publish(msg)
@@ -169,13 +170,15 @@ def main():
     parser.add_argument('--image_topic',
                         help="Override image topic; base topic is derived by stripping the last segment "
                              "(e.g. /drone0/.../camera/image -> /drone0/.../camera)")
+    parser.add_argument('--detections-topic', default='/drone0/debug/detected_gates_data',
+                        help="Detections topic to visualize (default: /drone0/debug/detected_gates_data)")
     # rclpy args are passed after '--'
     args, ros_args = parser.parse_known_args()
 
     rclpy.init(args=ros_args)
     node = DetectionsVisualizerNode(
         compressed=args.compressed, pub_comp=args.pub_comp, rectified=args.rectified,
-        image_topic=args.image_topic)
+        image_topic=args.image_topic, detections_topic=args.detections_topic)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
