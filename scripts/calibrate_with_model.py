@@ -133,79 +133,67 @@ class TRTYoloPose:
 
 
 class OnnxYoloPose:
-    """ONNX Runtime YOLO-pose inference — same interface as TRTYoloPose.
+    """ONNX pose inference via the compiled C++ ONNXBackend (ctypes).
 
-    Preprocessing: letterbox → 640×640 (pad=114), BGR→RGB, HWC→CHW, /255, float32.
-    Postprocessing: handles both [1,29,8400] and [1,8400,29] output layouts,
-    removes letterbox offset, applies cv2 NMS.
+    Delegates preprocessing, inference, and postprocessing entirely to the same
+    C++ code used by the ROS2 yolo_pose node, so results are byte-identical.
+    Requires libyolo_wrapper.so next to this script (built by build_yolo_wrapper.sh).
     """
-    INPUT_SIZE = 640
-    PAD_VAL = 114
+    MAX_DETS = 32
 
-    def __init__(self, model_path, conf=0.1, nms_iou=0.45):
-        import onnxruntime as ort
+    def __init__(self, model_path, conf=0.1, nms_iou=0.4):
+        import ctypes
         self.conf = conf
         self.nms_iou = nms_iou
-        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-        self._session = ort.InferenceSession(model_path, providers=providers)
-        self._in_name = self._session.get_inputs()[0].name
-        self._out_name = self._session.get_outputs()[0].name
-        print(f"  ONNX output: {self._out_name}  {self._session.get_outputs()[0].shape}")
 
-    def _preprocess(self, img_bgr):
-        h, w = img_bgr.shape[:2]
-        scale = min(self.INPUT_SIZE / w, self.INPUT_SIZE / h)
-        nw, nh = int(w * scale), int(h * scale)  # truncate, matching C++ static_cast<int>
-        resized = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_LINEAR)
-        pad_x = (self.INPUT_SIZE - nw) // 2
-        pad_y = (self.INPUT_SIZE - nh) // 2
-        canvas = np.full((self.INPUT_SIZE, self.INPUT_SIZE, 3), self.PAD_VAL, dtype=np.uint8)
-        canvas[pad_y:pad_y + nh, pad_x:pad_x + nw] = resized
-        rgb = canvas[:, :, ::-1].astype(np.float32) / 255.0
-        chw = np.ascontiguousarray(rgb.transpose(2, 0, 1))
-        return chw[np.newaxis], scale, pad_x, pad_y
+        so_path = os.path.join(os.path.dirname(__file__), 'libyolo_wrapper.so')
+        self._lib = ctypes.CDLL(so_path)
 
-    def _decode(self, out, scale, pad_x, pad_y):
-        if out.ndim == 3:
-            out = out[0]                    # drop batch dim → [f, a] or [a, f]
-        if out.shape[0] < out.shape[1]:     # transposed [features, anchors]
-            out = out.T                     # → [anchors, features]
-        num_kp = (out.shape[1] - 5) // 3
+        self._lib.yolo_create.restype = ctypes.c_void_p
+        self._lib.yolo_create.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        self._lib.yolo_destroy.argtypes = [ctypes.c_void_p]
+        self._lib.yolo_infer.restype = ctypes.c_int
+        self._lib.yolo_infer.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_int, ctypes.c_int,
+            ctypes.c_float, ctypes.c_float, ctypes.c_float,
+            ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+        ]
 
-        scores = out[:, 4]
-        mask = scores >= self.conf
-        if not np.any(mask):
-            return []
-        det = out[mask]
-        scores = scores[mask]
+        self._handle = self._lib.yolo_create(model_path.encode(), 640)
+        if not self._handle:
+            raise RuntimeError(f"Failed to load ONNX model: {model_path}")
+        print(f"  C++ ONNXBackend loaded: {model_path}")
 
-        cx = (det[:, 0] - pad_x) / scale
-        cy = (det[:, 1] - pad_y) / scale
-        bw = det[:, 2] / scale
-        bh = det[:, 3] / scale
-        boxes = [[float(x), float(y), float(w), float(h)]
-                 for x, y, w, h in zip((cx - bw / 2).tolist(),
-                                       (cy - bh / 2).tolist(),
-                                       bw.tolist(), bh.tolist())]
-        idxs = cv2.dnn.NMSBoxes(boxes, scores.tolist(), self.conf, self.nms_iou)
-        if len(idxs) == 0:
-            return []
+        self._out_buf = (ctypes.c_float * (self.MAX_DETS * 8 * 3))()
+        self._n_kp = ctypes.c_int(0)
 
-        results = []
-        for i in np.array(idxs).flatten():
-            kps = []
-            for k in range(num_kp):
-                kx = (det[i, 5 + k * 3] - pad_x) / scale
-                ky = (det[i, 5 + k * 3 + 1] - pad_y) / scale
-                kc = float(det[i, 5 + k * 3 + 2])
-                kps.append((float(kx), float(ky), kc))
-            results.append(kps)
-        return results
+    def __del__(self):
+        if hasattr(self, '_lib') and hasattr(self, '_handle') and self._handle:
+            self._lib.yolo_destroy(self._handle)
 
     def __call__(self, img_bgr):
-        inp, scale, pad_x, pad_y = self._preprocess(img_bgr)
-        out = self._session.run([self._out_name], {self._in_name: inp})[0]
-        return self._decode(out, scale, pad_x, pad_y)
+        import ctypes
+        h, w = img_bgr.shape[:2]
+        img_c = np.ascontiguousarray(img_bgr)
+        ptr = img_c.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+
+        n_dets = self._lib.yolo_infer(
+            self._handle, ptr, h, w,
+            self.conf, self.nms_iou, 0.3,
+            self._out_buf, self.MAX_DETS,
+            ctypes.byref(self._n_kp),
+        )
+        if n_dets == 0:
+            return []
+
+        n_kp = self._n_kp.value
+        flat = np.frombuffer(self._out_buf, dtype=np.float32, count=n_dets * n_kp * 3)
+        flat = flat.reshape(n_dets, n_kp, 3)
+        return [[(float(flat[d, k, 0]), float(flat[d, k, 1]), float(flat[d, k, 2]))
+                 for k in range(n_kp)]
+                for d in range(n_dets)]
 
 
 class UltralyticsYoloPose:
@@ -594,7 +582,13 @@ def main():
     parser.add_argument('--test', action='store_true',
                         help="Load _new.json calibration, show rectified image with reprojection. "
                              "No model inference, no calibration.")
+    parser.add_argument('--delay', type=float, default=0.0,
+                        help="Pose delay in milliseconds (can be negative). Shifts pose lookup by this offset.")
+    parser.add_argument('--delay-compute', action='store_true',
+                        help="Interactive delay tuning: j/l = ±1ms, k/i = ±10ms. No calibration.")
     args = parser.parse_args()
+
+    delay_ms = args.delay
 
     if args.only_calib and not args.model:
         parser.error("--only-calib requires --model")
@@ -744,7 +738,7 @@ def main():
         cv2.namedWindow('reprojection', cv2.WINDOW_NORMAL)
         if args.show_rectified and args.model:
             cv2.namedWindow('rectified', cv2.WINDOW_NORMAL)
-        print("Controls: SPACE/→ next  ←  prev  ↑ +10  ↓ -10  q/ESC quit")
+        print("Controls: SPACE/→ next  ←  prev  ↑ +10  ↓ -10  q/ESC quit  i/k ±10ms delay  j/l ±1ms delay")
 
     idx = 0
     while True:
@@ -758,7 +752,7 @@ def main():
                 break
         image_path = images[idx]
         ts_us = int(image_path.split('_')[-1].split('.')[0])
-        pose_idx = _find_nearest_idx(pose_ts_arr, ts_us)
+        pose_idx = _find_nearest_idx(pose_ts_arr, ts_us + int(delay_ms * 1000))
         pose_row = pose_df.iloc[pose_idx]
 
         if not args.only_calib:
@@ -808,7 +802,7 @@ def main():
             gate_ids_per_view.append(gate_id)
             gate_flipped_per_view.append(flipped)
 
-        if yolo_model is not None:
+        if yolo_model is not None and not args.delay_compute:
             if not args.only_calib:
                 rect_img = cv2.remap(img, rect_map1, rect_map2, cv2.INTER_LINEAR)
             else:
@@ -932,7 +926,9 @@ def main():
                       f"{len(candidates)} matched pairs (total calib views: {len(all_calib_views)})")
 
         if not args.only_calib:
-            print(f"[{idx + 1}/{len(images)}] ts={ts_us}  gates_visible={len(gate_projections)}")
+            print(f"[{idx + 1}/{len(images)}] ts={ts_us}  gates_visible={len(gate_projections)}  delay={delay_ms:.1f}ms")
+            cv2.putText(img, f"delay: {delay_ms:.1f} ms", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             cv2.imshow('reprojection', img)
             key = cv2.waitKey(0)
             if key == ord('q') or key == 27:
@@ -943,6 +939,14 @@ def main():
                 idx = max(idx - 10, 0)
             elif key == 81 or key == ord('a'):   # left arrow or a → -1
                 idx = max(idx - 1, 0)
+            elif args.delay_compute and key == ord('j'):
+                delay_ms -= 1.0
+            elif args.delay_compute and key == ord('l'):
+                delay_ms += 1.0
+            elif args.delay_compute and key == ord('k'):
+                delay_ms -= 10.0
+            elif args.delay_compute and key == ord('i'):
+                delay_ms += 10.0
             else:
                 idx += 1
         else:
@@ -951,7 +955,7 @@ def main():
     if not args.only_calib:
         cv2.destroyAllWindows()
 
-    if not args.test:
+    if not args.test and not args.delay_compute:
         if yolo_model is not None and all_calib_views:
             _run_calibration(all_calib_views, img_width, img_height,
                              args.fisheye, calib_out_path, args.max_calib_views)
