@@ -682,6 +682,8 @@ def main():
     parser.add_argument('--offboard', type=float, default=0.0,
                         help="Write an offboard RC message (data[6]=2010) at bag_start + this "
                              "many seconds (default: 0.0)")
+    parser.add_argument('--mcap', action='store_true',
+                        help="Write output bag in MCAP format instead of sqlite3 (db3)")
     args = parser.parse_args()
 
     if args.offboard < args.arm:
@@ -752,7 +754,8 @@ def main():
             return
         shutil.rmtree(output_bag_path)
 
-    storage_options, converter_options = get_rosbag_options(output_bag_path, 'sqlite3')
+    storage_id = 'mcap' if args.mcap else 'sqlite3'
+    storage_options, converter_options = get_rosbag_options(output_bag_path, storage_id)
     writer = rosbag2_py.SequentialWriter()
     writer.open(storage_options, converter_options)
 
