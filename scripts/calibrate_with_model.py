@@ -170,6 +170,87 @@ _OUTER_KEYPOINT_NAMES = ["top_left_outer", "top_right_outer", "bottom_right_oute
 _MODEL_KP_LABELS_4 = ["tli", "tri", "bri", "bli"]
 _MODEL_KP_LABELS_8 = ["bro", "blo", "tro", "tlo", "bri", "bli", "tri", "tli"]
 
+# Maps inner-corner label to index in gate_mean_corners (marker1..4 order)
+_INNER_LABEL_IDX = {'tli': 0, 'tri': 1, 'bri': 2, 'bli': 3}
+
+# Unit (Y, Z) offsets in gate-local frame (gate plane is X=0, Y=right, Z=up)
+_INNER_YZ = {'tli': (-1, 1), 'tri': (1, 1), 'bri': (1, -1), 'bli': (-1, -1)}
+_OUTER_YZ = {'tlo': (-1, 1), 'tro': (1, 1), 'bro': (1, -1), 'blo': (-1, -1)}
+
+
+def _get_obj_pt(label, computed_corners, half_i, half_o,
+                gate_id, gate_rots, gate_mean_corners, gate_mean_centers,
+                flipped=False):
+    """Return 3-D object point (Y, Z, 0) in gate-local plane for calibration.
+
+    When flipped=True (drone viewing from behind the gate), the visual label
+    maps to the mirrored physical corner — negate Y to get the correct 3-D
+    position (visual left ↔ physical right in the gate-local Y axis).
+    """
+    if computed_corners:
+        if label in _INNER_YZ:
+            y, z = _INNER_YZ[label][0] * half_i, _INNER_YZ[label][1] * half_i
+        elif label in _OUTER_YZ:
+            y, z = _OUTER_YZ[label][0] * half_o, _OUTER_YZ[label][1] * half_o
+        else:
+            return None
+    else:
+        idx = _INNER_LABEL_IDX.get(label)
+        if idx is None:
+            return None  # outer corners unavailable without --computed-corners
+        world_pt = gate_mean_corners[gate_id][idx]
+        local = gate_rots[gate_id].apply(world_pt - gate_mean_centers[gate_id])
+        y, z = float(local[1]), float(local[2])
+    if flipped:
+        y = -y  # visual label maps to opposite physical side when viewed from behind
+    return np.array([y, z, 0.0], dtype=np.float32)
+
+
+def _run_calibration(all_calib_views, img_width, img_height, fisheye, calib_out_path,
+                     max_views=500):
+    import random
+    n_views = len(all_calib_views)
+    total_pts = sum(len(v[0]) for v in all_calib_views)
+    print(f"\nCollected: {n_views} views, {total_pts} total 2D-3D pairs")
+    if n_views < 4:
+        print("ERROR: need at least 4 views — collect more data.")
+        return
+    if n_views < 20:
+        print(f"WARNING: only {n_views} views; result may be imprecise (recommend ≥20).")
+    if n_views > max_views:
+        all_calib_views = random.sample(all_calib_views, max_views)
+        print(f"Subsampled to {max_views} views (use --max-calib-views to change)")
+    n_views = len(all_calib_views)
+    total_pts = sum(len(v[0]) for v in all_calib_views)
+    print(f"Calibrating: {n_views} views, {total_pts} total 2D-3D pairs")
+    obj_pts = [v[0] for v in all_calib_views]
+    img_pts = [v[1] for v in all_calib_views]
+    img_size = (img_width, img_height)
+    if fisheye:
+        obj_pts_f = [p.reshape(-1, 1, 3) for p in obj_pts]
+        img_pts_f = [p.reshape(-1, 1, 2) for p in img_pts]
+        K_out = np.zeros((3, 3))
+        D_out = np.zeros((4, 1))
+        flags = (cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC |
+                 cv2.fisheye.CALIB_FIX_SKEW |
+                 cv2.fisheye.CALIB_CHECK_COND)
+        print("Running cv2.fisheye.calibrate ...")
+        rms, K_out, D_out, _, _ = cv2.fisheye.calibrate(
+            obj_pts_f, img_pts_f, img_size, K_out, D_out, flags=flags)
+        dist_list = D_out.flatten().tolist()
+    else:
+        print("Running cv2.calibrateCamera ...")
+        rms, K_out, dist_arr, _, _ = cv2.calibrateCamera(
+            obj_pts, img_pts, img_size, None, None)
+        dist_list = dist_arr.flatten().tolist()
+    print(f"RMS reprojection error: {rms:.4f} px")
+    print(f"K =\n{K_out}")
+    print(f"dist = {[round(x, 8) for x in dist_list]}")
+    result = {"mtx": K_out.tolist(), "dist": [dist_list]}
+    with open(calib_out_path, 'w') as f:
+        json.dump(result, f, indent=4)
+    print(f"Saved → {calib_out_path}")
+
 _ROT_COLS = [f'drone_rot[{i}]' for i in range(9)]
 
 
@@ -235,7 +316,7 @@ def precompute_gate_orientations(df, gate_ids, fix_rotation):
             orig_rot = np.column_stack([z_axis_orig, x_axis_3d, y_axis_orig])
             gate_rots[gate_id] = Rotation.from_matrix(orig_rot).inv()
             gate_quats[gate_id] = Rotation.from_matrix(orig_rot).as_quat()
-    return gate_quats, gate_mean_centers, gate_mean_corners
+    return gate_quats, gate_rots, gate_mean_centers, gate_mean_corners
 
 
 _OUTER_OPP = {0: 2, 1: 3, 2: 0, 3: 1}  # opposite corner index in the outer quad
@@ -243,9 +324,9 @@ _OUTER_OPP = {0: 2, 1: 3, 2: 0, 3: 1}  # opposite corner index in the outer quad
 
 def _apply_occlusion(candidates):
     for i in range(1, len(candidates)):
-        projected_i, visible_i = candidates[i][0], candidates[i][1]
+        projected_i, visible_i = candidates[i][1], candidates[i][2]
         for j in range(i):
-            projected_j, visible_j = candidates[j][0], candidates[j][1]
+            projected_j, visible_j = candidates[j][1], candidates[j][2]
 
             outer_vis = visible_j[4:8]
             n_missing = int(np.count_nonzero(~outer_vis))
@@ -385,17 +466,18 @@ def project_gates(pose_row, gate_ids, gate_quats, gate_mean_centers, gate_mean_c
             continue
 
         depth = float(corners_cam[:, 2].mean())
-        candidates.append([projected, visible.copy(), depth, in_front.copy(), no_wraparound.copy(), kp_names])
+        flipped = dot < 0
+        candidates.append([gate_id, projected, visible.copy(), depth, in_front.copy(), no_wraparound.copy(), kp_names, flipped])
 
-    candidates.sort(key=lambda c: c[2])
+    candidates.sort(key=lambda c: c[3])
     if computed_corners:
         _apply_occlusion(candidates)
 
     result = []
-    for projected, visible, _, in_front, no_wrap, names in candidates:
+    for gid, projected, visible, _, in_front, no_wrap, names, flipped in candidates:
         if np.count_nonzero(visible) < min_visible_corners:
             continue
-        result.append((projected, visible, in_front & no_wrap, names))
+        result.append((gid, projected, visible, in_front & no_wrap, names, flipped))
     return result
 
 
@@ -429,15 +511,34 @@ def main():
                         help="Open a second window showing the rectified image with inference drawn")
     parser.add_argument('--match-dist', type=float, default=50.0,
                         help="Max pixel distance for Hungarian corner matching (default: 50)")
+    parser.add_argument('--only-calib', action='store_true',
+                        help="Skip image display, collect all frames silently, then calibrate. Requires --model.")
+    parser.add_argument('--max-calib-views', type=int, default=500,
+                        help="Max views fed to calibrateCamera (randomly subsampled if more, default: 500)")
+    parser.add_argument('--test', action='store_true',
+                        help="Load _new.json calibration, show rectified image with reprojection. "
+                             "No model inference, no calibration.")
     args = parser.parse_args()
+
+    if args.only_calib and not args.model:
+        parser.error("--only-calib requires --model")
 
     flight_type = "piloted" if "p-" in args.flight else "autonomous"
     flight_dir = os.path.join("..", "data", flight_type, args.flight)
 
     # Load calibration
     calib_path = get_calibration_path(args.flight)
-    with open(calib_path) as f:
-        calib = json.load(f)
+    calib_out_path = calib_path.replace('.json', '_new.json')
+    if args.test:
+        if not os.path.exists(calib_out_path):
+            raise FileNotFoundError(f"--test requires a calibrated file at {calib_out_path}. "
+                                    "Run without --test first to generate it.")
+        with open(calib_out_path) as f:
+            calib = json.load(f)
+        print(f"--test: loaded calibration from {calib_out_path}")
+    else:
+        with open(calib_path) as f:
+            calib = json.load(f)
     K = np.array(calib['mtx'])
     dist = np.array(calib['dist'][0])
     if args.fisheye and len(dist) > 4:
@@ -456,7 +557,7 @@ def main():
         for col in gate_corners_df.columns
         if col.startswith('gate') and '_marker1_x' in col
     })
-    gate_quats, gate_mean_centers, gate_mean_corners = precompute_gate_orientations(
+    gate_quats, gate_rots, gate_mean_centers, gate_mean_corners = precompute_gate_orientations(
         gate_corners_df, gate_ids, args.fix_rotation)
 
     if args.computed_corners:
@@ -509,9 +610,9 @@ def main():
     BLUE = (255, 0, 0)
     ORANGE = (0, 165, 255)
 
-    # Rectification maps for model inference (inference is done on rectified image)
+    # Rectification maps — used for model inference AND for --test display
     rect_map1 = rect_map2 = new_K = None
-    if args.model:
+    if args.model or args.test:
         if args.fisheye:
             D4 = dist.reshape(4, 1)
             new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
@@ -523,66 +624,97 @@ def main():
                 K, dist, (img_width, img_height), alpha=0)
             rect_map1, rect_map2 = cv2.initUndistortRectifyMap(
                 K, dist, None, new_K, (img_width, img_height), cv2.CV_32FC1)
-        if args.model.endswith('.pt'):
-            yolo_model = UltralyticsYoloPose(args.model, conf=args.conf)
+        if args.model and not args.test:
+            if args.model.endswith('.pt'):
+                yolo_model = UltralyticsYoloPose(args.model, conf=args.conf)
+            else:
+                yolo_model = TRTYoloPose(args.model, conf=args.conf)
         else:
-            yolo_model = TRTYoloPose(args.model, conf=args.conf)
+            yolo_model = None
     else:
         yolo_model = None
 
-    cv2.namedWindow('reprojection', cv2.WINDOW_NORMAL)
-    if args.show_rectified and args.model:
-        cv2.namedWindow('rectified', cv2.WINDOW_NORMAL)
-    print("Controls: SPACE/→ next  ←  prev  ↑ +10  ↓ -10  q/ESC quit")
+    all_calib_views = []  # (obj_pts (N,3), img_pts (N,2)) — one per gate-per-frame view
+
+    if not args.only_calib:
+        cv2.namedWindow('reprojection', cv2.WINDOW_NORMAL)
+        if args.show_rectified and args.model:
+            cv2.namedWindow('rectified', cv2.WINDOW_NORMAL)
+        print("Controls: SPACE/→ next  ←  prev  ↑ +10  ↓ -10  q/ESC quit")
 
     idx = 0
-    while 0 <= idx < len(images):
+    while True:
+        if args.only_calib:
+            if idx >= len(images):
+                break
+            if idx % 50 == 0:
+                print(f"  Frame {idx + 1}/{len(images)}, calib views so far: {len(all_calib_views)}")
+        else:
+            if not (0 <= idx < len(images)):
+                break
         image_path = images[idx]
         ts_us = int(image_path.split('_')[-1].split('.')[0])
         pose_idx = _find_nearest_idx(pose_ts_arr, ts_us)
         pose_row = pose_df.iloc[pose_idx]
 
-        img = cv2.imread(image_path)
+        if not args.only_calib:
+            raw_img = cv2.imread(image_path)
+            if args.test:
+                img = cv2.remap(raw_img, rect_map1, rect_map2, cv2.INTER_LINEAR)
+            else:
+                img = raw_img
+
+        # --test: project onto rectified plane (new_K, zero distortion)
+        proj_K = new_K if args.test else K
+        proj_dist = np.zeros(4 if args.fisheye else 5) if args.test else dist
 
         gate_projections = project_gates(
             pose_row, gate_ids, gate_quats, gate_mean_centers, gate_mean_corners,
             args.computed_corners, inner_corners_local, outer_corners_local,
-            K, dist, R_cam_inv, t_cam,
+            proj_K, proj_dist, R_cam_inv, t_cam,
             img_width, img_height,
             args.min_visible_corners, args.fisheye, args.gate_depth,
         )
 
-        # Build per-gate corner dicts {label: (x,y)} for visible corners
+        # Build per-gate corner dicts {label: (x,y)} for visible corners + track gate_ids
         gate_corners = []
-        for projected, visible, drawable, kp_names in gate_projections:
+        gate_ids_per_view = []
+        gate_flipped_per_view = []
+        for gate_id, projected, visible, drawable, kp_names, flipped in gate_projections:
             gate = {}
             for i, (pt, vis, draw) in enumerate(zip(projected, visible, drawable)):
-                if vis:
-                    color = GREEN
-                elif draw and not args.v_only:
-                    color = RED
-                else:
-                    continue
-                draw_x(img, pt, color)
-                if args.labels:
-                    parts = kp_names[i].split('_')
-                    label = parts[0][0] + parts[1][0] + parts[2][0]
-                    lx, ly = int(round(float(pt[0]))) + 10, int(round(float(pt[1]))) - 5
-                    cv2.putText(img, label, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                if not args.only_calib:
+                    if vis:
+                        color = GREEN
+                    elif draw and not args.v_only:
+                        color = RED
+                    else:
+                        continue
+                    draw_x(img, pt, color)
+                    if args.labels:
+                        parts = kp_names[i].split('_')
+                        label = parts[0][0] + parts[1][0] + parts[2][0]
+                        lx, ly = int(round(float(pt[0]))) + 10, int(round(float(pt[1]))) - 5
+                        cv2.putText(img, label, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
                 if vis:
                     parts = kp_names[i].split('_')
                     lbl = parts[0][0] + parts[1][0] + parts[2][0]
                     gate[lbl] = (float(pt[0]), float(pt[1]))
             gate_corners.append(gate)
+            gate_ids_per_view.append(gate_id)
+            gate_flipped_per_view.append(flipped)
 
         if yolo_model is not None:
-            rect_img = cv2.remap(img, rect_map1, rect_map2, cv2.INTER_LINEAR)
+            if not args.only_calib:
+                rect_img = cv2.remap(img, rect_map1, rect_map2, cv2.INTER_LINEAR)
+            else:
+                raw_img = cv2.imread(image_path)
+                rect_img = cv2.remap(raw_img, rect_map1, rect_map2, cv2.INTER_LINEAR)
             detections = yolo_model(rect_img)
-            print(f"  model: {len(detections)} detections (conf≥{args.conf})")
 
-            # Back-project all detections and build per-detection corner dicts
-            det_corners = []   # [{label: (x,y)}, ...]  in distorted space
-            det_rect_pts = []  # [{label: (kx,ky)}, ...]  in rectified space (for show_rectified)
+            # Back-project all detections to distorted image space
+            det_corners = []
+            det_rect_pts = []
             for kps in detections:
                 pts_rect = np.array([[kx, ky] for kx, ky, _ in kps], dtype=np.float64)
                 x_n = (pts_rect[:, 0] - new_K[0, 2]) / new_K[0, 0]
@@ -607,24 +739,24 @@ def main():
                 det_corners.append(det)
                 det_rect_pts.append(det_r)
 
-            # Draw blue X for all detected keypoints
-            for det, det_r in zip(det_corners, det_rect_pts):
-                for label, (dx, dy) in det.items():
-                    draw_x(img, (dx, dy), BLUE)
-                    if args.labels:
-                        cv2.putText(img, label,
-                                    (int(round(dx)) + 10, int(round(dy)) - 5),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, BLUE, 1)
-                    if args.show_rectified:
-                        rx, ry = det_r[label]
-                        draw_x(rect_img, (rx, ry), BLUE)
+            if not args.only_calib:
+                for det, det_r in zip(det_corners, det_rect_pts):
+                    for label, (dx, dy) in det.items():
+                        draw_x(img, (dx, dy), BLUE)
                         if args.labels:
-                            cv2.putText(rect_img, label,
-                                        (int(round(rx)) + 10, int(round(ry)) - 5),
+                            cv2.putText(img, label,
+                                        (int(round(dx)) + 10, int(round(dy)) - 5),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, BLUE, 1)
+                        if args.show_rectified:
+                            rx, ry = det_r[label]
+                            draw_x(rect_img, (rx, ry), BLUE)
+                            if args.labels:
+                                cv2.putText(rect_img, label,
+                                            (int(round(rx)) + 10, int(round(ry)) - 5),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, BLUE, 1)
 
             # --- Gate-level Hungarian: assign each detection to one gate ---
-            candidates = []
+            candidates = []  # (d, gi, gate_id, lbl, obj_pt, img_pt_float, gpt_int, dpt_int)
             if gate_corners and det_corners:
                 n_g, n_d = len(gate_corners), len(det_corners)
                 cost_mat = np.full((n_g, n_d), np.inf)
@@ -634,9 +766,8 @@ def main():
                         if not common:
                             continue
                         cost_mat[gi, di] = np.mean([
-                            np.linalg.norm(np.array(gate[l]) - np.array(det[l]))
-                            for l in common])
-                # Replace inf so linear_sum_assignment can run
+                            np.linalg.norm(np.array(gate[lbl]) - np.array(det[lbl]))
+                            for lbl in common])
                 big = np.nanmax(cost_mat[np.isfinite(cost_mat)]) * 10 + 1000 \
                     if np.any(np.isfinite(cost_mat)) else 1000.0
                 row_ind, col_ind = linear_sum_assignment(
@@ -644,6 +775,8 @@ def main():
                 for gi, di in zip(row_ind, col_ind):
                     if not np.isfinite(cost_mat[gi, di]):
                         continue
+                    g_id = gate_ids_per_view[gi]
+                    g_flipped = gate_flipped_per_view[gi]
                     gate = gate_corners[gi]
                     det = det_corners[di]
                     for lbl in set(gate) & set(det):
@@ -651,38 +784,75 @@ def main():
                         dpt = det[lbl]
                         d = float(np.linalg.norm(np.array(gpt) - np.array(dpt)))
                         if d <= args.match_dist:
-                            candidates.append((d,
-                                               (int(round(gpt[0])), int(round(gpt[1]))),
-                                               (int(round(dpt[0])), int(round(dpt[1])))))
-            # IQR outlier rejection across all matched corner pairs
+                            obj_pt = _get_obj_pt(
+                                lbl, args.computed_corners,
+                                half_i if args.computed_corners else 0.0,
+                                half_o if args.computed_corners else 0.0,
+                                g_id, gate_rots, gate_mean_corners, gate_mean_centers,
+                                flipped=g_flipped)
+                            if obj_pt is not None:
+                                candidates.append((
+                                    d, gi, g_id, lbl, obj_pt,
+                                    (float(dpt[0]), float(dpt[1])),
+                                    (int(round(gpt[0])), int(round(gpt[1]))),
+                                    (int(round(dpt[0])), int(round(dpt[1])))))
+
+            # IQR outlier rejection
             if len(candidates) >= 4:
-                dists = np.array([d for d, _, _ in candidates])
+                dists = np.array([c[0] for c in candidates])
                 q1, q3 = np.percentile(dists, [25, 75])
-                iqr = q3 - q1
-                upper = q3 + 1.5 * iqr
-                candidates = [(d, pg, pm) for d, pg, pm in candidates if d <= upper]
-            for _, pt_g, pt_m in candidates:
-                cv2.line(img, pt_g, pt_m, ORANGE, 1)
+                upper = q3 + 1.5 * (q3 - q1)
+                candidates = [c for c in candidates if c[0] <= upper]
 
-            if args.show_rectified:
-                cv2.imshow('rectified', rect_img)
+            if not args.only_calib:
+                for c in candidates:
+                    cv2.line(img, c[6], c[7], ORANGE, 1)
 
-        print(f"[{idx + 1}/{len(images)}] ts={ts_us}  gates_visible={len(gate_projections)}")
-        cv2.imshow('reprojection', img)
+            # Collect calibration views (group survivors by gate instance)
+            view_data = {}
+            for c in candidates:
+                gi = c[1]
+                view_data.setdefault(gi, {'obj': [], 'img': []})
+                view_data[gi]['obj'].append(c[4])
+                view_data[gi]['img'].append(list(c[5]))
+            for vd in view_data.values():
+                if len(vd['obj']) >= 4:
+                    all_calib_views.append((
+                        np.array(vd['obj'], dtype=np.float32),
+                        np.array(vd['img'], dtype=np.float32)))
 
-        key = cv2.waitKey(0)
-        if key == ord('q') or key == 27:
-            break
-        elif key == 82 or key == ord('w'):   # up arrow or w → +10
-            idx = min(idx + 10, len(images) - 1)
-        elif key == 84 or key == ord('s'):   # down arrow or s → -10
-            idx = max(idx - 10, 0)
-        elif key == 81 or key == ord('a'):   # left arrow or a → -1
-            idx = max(idx - 1, 0)
-        else:                                 # anything else (space, right arrow, etc.) → +1
+            if not args.only_calib:
+                if args.show_rectified:
+                    cv2.imshow('rectified', rect_img)
+                print(f"  model: {len(detections)} detections, "
+                      f"{len(candidates)} matched pairs (total calib views: {len(all_calib_views)})")
+
+        if not args.only_calib:
+            print(f"[{idx + 1}/{len(images)}] ts={ts_us}  gates_visible={len(gate_projections)}")
+            cv2.imshow('reprojection', img)
+            key = cv2.waitKey(0)
+            if key == ord('q') or key == 27:
+                break
+            elif key == 82 or key == ord('w'):   # up arrow or w → +10
+                idx = min(idx + 10, len(images) - 1)
+            elif key == 84 or key == ord('s'):   # down arrow or s → -10
+                idx = max(idx - 10, 0)
+            elif key == 81 or key == ord('a'):   # left arrow or a → -1
+                idx = max(idx - 1, 0)
+            else:
+                idx += 1
+        else:
             idx += 1
 
-    cv2.destroyAllWindows()
+    if not args.only_calib:
+        cv2.destroyAllWindows()
+
+    if not args.test:
+        if yolo_model is not None and all_calib_views:
+            _run_calibration(all_calib_views, img_width, img_height,
+                             args.fisheye, calib_out_path, args.max_calib_views)
+        elif yolo_model is not None:
+            print("No calibration data collected — no views passed all filters.")
 
 
 if __name__ == '__main__':
