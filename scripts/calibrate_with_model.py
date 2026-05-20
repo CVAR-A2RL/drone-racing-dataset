@@ -67,7 +67,7 @@ class TRTYoloPose:
     def _preprocess(self, img_bgr):
         h, w = img_bgr.shape[:2]
         scale = min(self.INPUT_SIZE / w, self.INPUT_SIZE / h)
-        nw, nh = int(round(w * scale)), int(round(h * scale))
+        nw, nh = int(w * scale), int(h * scale)  # truncate, matching C++ static_cast<int>
         resized = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_LINEAR)
         pad_x = (self.INPUT_SIZE - nw) // 2
         pad_y = (self.INPUT_SIZE - nh) // 2
@@ -130,6 +130,82 @@ class TRTYoloPose:
         self._cuda.memcpy_dtoh_async(self._out_host, self._out_dev, self.stream)
         self.stream.synchronize()
         return self._decode(self._out_host.copy(), scale, pad_x, pad_y)
+
+
+class OnnxYoloPose:
+    """ONNX Runtime YOLO-pose inference — same interface as TRTYoloPose.
+
+    Preprocessing: letterbox → 640×640 (pad=114), BGR→RGB, HWC→CHW, /255, float32.
+    Postprocessing: handles both [1,29,8400] and [1,8400,29] output layouts,
+    removes letterbox offset, applies cv2 NMS.
+    """
+    INPUT_SIZE = 640
+    PAD_VAL = 114
+
+    def __init__(self, model_path, conf=0.1, nms_iou=0.45):
+        import onnxruntime as ort
+        self.conf = conf
+        self.nms_iou = nms_iou
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        self._session = ort.InferenceSession(model_path, providers=providers)
+        self._in_name = self._session.get_inputs()[0].name
+        self._out_name = self._session.get_outputs()[0].name
+        print(f"  ONNX output: {self._out_name}  {self._session.get_outputs()[0].shape}")
+
+    def _preprocess(self, img_bgr):
+        h, w = img_bgr.shape[:2]
+        scale = min(self.INPUT_SIZE / w, self.INPUT_SIZE / h)
+        nw, nh = int(w * scale), int(h * scale)  # truncate, matching C++ static_cast<int>
+        resized = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        pad_x = (self.INPUT_SIZE - nw) // 2
+        pad_y = (self.INPUT_SIZE - nh) // 2
+        canvas = np.full((self.INPUT_SIZE, self.INPUT_SIZE, 3), self.PAD_VAL, dtype=np.uint8)
+        canvas[pad_y:pad_y + nh, pad_x:pad_x + nw] = resized
+        rgb = canvas[:, :, ::-1].astype(np.float32) / 255.0
+        chw = np.ascontiguousarray(rgb.transpose(2, 0, 1))
+        return chw[np.newaxis], scale, pad_x, pad_y
+
+    def _decode(self, out, scale, pad_x, pad_y):
+        if out.ndim == 3:
+            out = out[0]                    # drop batch dim → [f, a] or [a, f]
+        if out.shape[0] < out.shape[1]:     # transposed [features, anchors]
+            out = out.T                     # → [anchors, features]
+        num_kp = (out.shape[1] - 5) // 3
+
+        scores = out[:, 4]
+        mask = scores >= self.conf
+        if not np.any(mask):
+            return []
+        det = out[mask]
+        scores = scores[mask]
+
+        cx = (det[:, 0] - pad_x) / scale
+        cy = (det[:, 1] - pad_y) / scale
+        bw = det[:, 2] / scale
+        bh = det[:, 3] / scale
+        boxes = [[float(x), float(y), float(w), float(h)]
+                 for x, y, w, h in zip((cx - bw / 2).tolist(),
+                                       (cy - bh / 2).tolist(),
+                                       bw.tolist(), bh.tolist())]
+        idxs = cv2.dnn.NMSBoxes(boxes, scores.tolist(), self.conf, self.nms_iou)
+        if len(idxs) == 0:
+            return []
+
+        results = []
+        for i in np.array(idxs).flatten():
+            kps = []
+            for k in range(num_kp):
+                kx = (det[i, 5 + k * 3] - pad_x) / scale
+                ky = (det[i, 5 + k * 3 + 1] - pad_y) / scale
+                kc = float(det[i, 5 + k * 3 + 2])
+                kps.append((float(kx), float(ky), kc))
+            results.append(kps)
+        return results
+
+    def __call__(self, img_bgr):
+        inp, scale, pad_x, pad_y = self._preprocess(img_bgr)
+        out = self._session.run([self._out_name], {self._in_name: inp})[0]
+        return self._decode(out, scale, pad_x, pad_y)
 
 
 class UltralyticsYoloPose:
@@ -578,10 +654,36 @@ def main():
     else:
         inner_corners_local = outer_corners_local = None
 
-    # Load synced CSV for drone pose (one row per camera frame)
-    synced_csv = os.path.join(flight_dir, f'{args.flight}_cam_ts_sync.csv')
-    pose_df = pd.read_csv(synced_csv)
+    # Load drone pose directly from the original bag SQLite — same source as
+    # create_std_bag.py. DroneState timestamps are system-clock µs (same domain
+    # as camera filenames), and the quaternion is the exact rotation used in the
+    # bag, avoiding the ~0.6° drift seen in the mocap CSV rotation matrix.
+    # CDR layout: [4B header][8B uint64 timestamp][3×8B pos x,y,z][4×8B quat x,y,z,w]
+    import sqlite3
+    import struct as _struct
+
+    bag_db = os.path.join(flight_dir, f'ros2bag_{args.flight}', f'ros2bag_{args.flight}.db3')
+    con = sqlite3.connect(bag_db)
+    rows = con.execute(
+        "SELECT m.data FROM messages m JOIN topics t ON m.topic_id=t.id "
+        "WHERE t.name='/perception/drone_state' ORDER BY m.timestamp"
+    ).fetchall()
+    con.close()
+
+    records = []
+    for (data,) in rows:
+        if len(data) < 60:
+            continue
+        ts = _struct.unpack_from('<Q', data, 4)[0]
+        px, py, pz = _struct.unpack_from('<3d', data, 12)
+        qx, qy, qz, qw = _struct.unpack_from('<4d', data, 36)
+        R_inv = Rotation.from_quat([qx, qy, qz, qw]).inv().as_matrix()
+        records.append([ts, px, py, pz] + R_inv.flatten().tolist())
+
+    rot_col_names = [f'drone_rot[{i}]' for i in range(9)]
+    pose_df = pd.DataFrame(records, columns=['timestamp', 'drone_x', 'drone_y', 'drone_z'] + rot_col_names)
     pose_ts_arr = pose_df['timestamp'].values
+    print(f"Loaded {len(pose_df)} DroneState poses from bag")
 
     # Load images
     image_dir = os.path.join(flight_dir, f'camera_{args.flight}')
@@ -625,7 +727,9 @@ def main():
             rect_map1, rect_map2 = cv2.initUndistortRectifyMap(
                 K, dist, None, new_K, (img_width, img_height), cv2.CV_32FC1)
         if args.model and not args.test:
-            if args.model.endswith('.pt'):
+            if args.model.endswith('.onnx'):
+                yolo_model = OnnxYoloPose(args.model, conf=args.conf)
+            elif args.model.endswith('.pt'):
                 yolo_model = UltralyticsYoloPose(args.model, conf=args.conf)
             else:
                 yolo_model = TRTYoloPose(args.model, conf=args.conf)
